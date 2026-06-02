@@ -1,0 +1,21 @@
+{
+  "name": "gpt-organizer",
+  "description": "Local Chrome extension: batch organize ChatGPT sidebar conversations",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "compile": "tsc --noEmit",
+    "postinstall": "wxt prepare",
+    "probe:api": "node scripts/probe-api.mjs",
+    "probe:dom": "node scripts/probe-dom.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0",
+    "typescript": "^5.9.3",
+    "wxt": "^0.20.26"
+  }
+}

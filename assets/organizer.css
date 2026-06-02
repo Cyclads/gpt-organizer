@@ -1,0 +1,143 @@
+#gpt-organizer-root {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 10000;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px;
+  color: #ececec;
+  max-width: min(320px, calc(100vw - 32px));
+}
+
+#gpt-organizer-root[data-active="false"] .gpt-organizer-panel {
+  opacity: 0.55;
+}
+
+#gpt-organizer-root[data-busy="true"] .gpt-organizer-panel {
+  pointer-events: none;
+  opacity: 0.75;
+}
+
+.gpt-organizer-panel {
+  background: #171717;
+  border: 1px solid #3f3f46;
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  padding: 12px;
+}
+
+.gpt-organizer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.gpt-organizer-badge {
+  background: #2563eb;
+  color: #fff;
+  border-radius: 999px;
+  min-width: 1.5rem;
+  text-align: center;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.gpt-organizer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.gpt-organizer-actions button,
+.gpt-organizer-move select {
+  font: inherit;
+  border-radius: 8px;
+  border: 1px solid #52525b;
+  background: #27272a;
+  color: inherit;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.gpt-organizer-actions button:hover,
+.gpt-organizer-move select:hover {
+  background: #3f3f46;
+}
+
+.gpt-organizer-actions button.danger {
+  border-color: #b91c1c;
+  background: #7f1d1d;
+}
+
+.gpt-organizer-move {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.gpt-organizer-move select {
+  width: 100%;
+}
+
+.gpt-organizer-status {
+  margin: 0;
+  font-size: 12px;
+  color: #a1a1aa;
+  min-height: 1.2em;
+}
+
+.gpt-organizer-status[data-error="true"] {
+  color: #fca5a5;
+}
+
+label.gpt-organizer-checkbox-wrap {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  margin-inline-end: 6px;
+  cursor: pointer;
+}
+
+input.gpt-organizer-checkbox {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #2563eb;
+  cursor: pointer;
+}
+
+a[data-sidebar-item="true"]:has(.gpt-organizer-checkbox-wrap) {
+  display: flex;
+  align-items: center;
+}
+
+@media (prefers-color-scheme: light) {
+  #gpt-organizer-root {
+    color: #18181b;
+  }
+
+  .gpt-organizer-panel {
+    background: #fafafa;
+    border-color: #d4d4d8;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+  }
+
+  .gpt-organizer-actions button,
+  .gpt-organizer-move select {
+    background: #fff;
+    border-color: #d4d4d8;
+  }
+
+  .gpt-organizer-actions button:hover,
+  .gpt-organizer-move select:hover {
+    background: #f4f4f5;
+  }
+
+  .gpt-organizer-status {
+    color: #71717a;
+  }
+}

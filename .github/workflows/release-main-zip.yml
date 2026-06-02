@@ -1,0 +1,58 @@
+name: Release ZIP (main)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main-zip
+  cancel-in-progress: true
+
+jobs:
+  zip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build extension zip
+        run: |
+          bun install --frozen-lockfile
+          bun run zip
+
+      - name: Stable filename for download links
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          matches=(dist/gpt-organizer-*-chrome.zip)
+          if [[ ${#matches[@]} -ne 1 ]]; then
+            echo "Expected exactly one dist/gpt-organizer-*-chrome.zip, found ${#matches[@]}"
+            ls -la dist
+            exit 1
+          fi
+          cp "${matches[0]}" gpt-organizer-chrome-main.zip
+          ls -la gpt-organizer-chrome-main.zip
+
+      - name: Upload to rolling prerelease (tag continuous)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          ZIP="gpt-organizer-chrome-main.zip"
+          if gh release view continuous --repo "$REPO" &>/dev/null; then
+            gh release upload continuous "$ZIP" --clobber --repo "$REPO"
+          else
+            gh release create continuous "$ZIP" \
+              --repo "$REPO" \
+              --title "Latest build (main)" \
+              --notes "Automated build from \`main\`. Unzip, then Chrome → **Load unpacked** → folder with \`manifest.json\` at the root (or use the unzipped tree directly)." \
+              --prerelease
+          fi
