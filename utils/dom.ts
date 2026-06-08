@@ -44,16 +44,20 @@ export function parseConversationLink(anchor: Element): ConversationRow | null {
   return { id, title, element: anchor };
 }
 
+/** Conversation rows in sidebar DOM order (top → bottom). */
 export function findVisibleConversations(root: ParentNode = document): ConversationRow[] {
   const links = root.querySelectorAll(SELECTORS.conversationLink);
   const byId = new Map<string, ConversationRow>();
+  const order: string[] = [];
 
   for (const link of links) {
     const parsed = parseConversationLink(link);
-    if (parsed) byId.set(parsed.id, parsed);
+    if (!parsed || byId.has(parsed.id)) continue;
+    byId.set(parsed.id, parsed);
+    order.push(parsed.id);
   }
 
-  return [...byId.values()];
+  return order.map((id) => byId.get(id)!);
 }
 
 export function findProjectsInSidebar(
@@ -80,18 +84,18 @@ export function findProjectsInSidebar(
 export function findSidebarContainer(): Element | null {
   const projectMarker = document.querySelector('[data-testid="sidebar-item-projects"]');
   if (projectMarker) {
-    const nav = projectMarker.closest('nav');
+    const nav = projectMarker.closest('nav, aside');
     if (nav) return nav;
   }
 
   const firstConv = document.querySelector(SELECTORS.conversationLink);
   if (firstConv) {
-    const nav = firstConv.closest('nav');
+    const nav = firstConv.closest('nav, aside');
     if (nav) return nav;
-    return firstConv.closest('aside') ?? firstConv.parentElement;
+    return firstConv.parentElement;
   }
 
-  return document.querySelector('nav');
+  return document.querySelector('nav, aside');
 }
 
 export function findOptionsButton(conversationId: string): Element | null {

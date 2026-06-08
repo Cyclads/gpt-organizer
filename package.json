@@ -11,9 +11,12 @@
     "compile": "tsc --noEmit",
     "postinstall": "wxt prepare",
     "probe:api": "node scripts/probe-api.mjs",
-    "probe:dom": "node scripts/probe-dom.mjs"
+    "probe:dom": "node scripts/probe-dom.mjs",
+    "website:dev": "cd website && bun run dev",
+    "website:build": "cd website && bun install && bun run build"
   },
   "devDependencies": {
+    "@wxt-dev/auto-icons": "^1.1.0",
     "playwright": "^1.60.0",
     "typescript": "^5.9.3",
     "wxt": "^0.20.26"

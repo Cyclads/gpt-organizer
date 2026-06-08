@@ -16,8 +16,18 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Build extension
+      - name: Extension
         run: |
           bun install --frozen-lockfile
           bun run compile
+          bun run build
+
+      - name: GitHub Pages site
+        working-directory: website
+        env:
+          VITE_SITE_URL: https://example.github.io/gpt-organizer
+          VITE_BASE_PATH: /gpt-organizer/
+          VITE_GITHUB_REPO: example/gpt-organizer
+        run: |
+          bun install --frozen-lockfile
           bun run build
