@@ -1,6 +1,7 @@
 # Deploy marketing site to GitHub Pages (project site: /gpt-organizer/).
 #
 # One-time: Settings → Pages → Build and deployment → Source: GitHub Actions.
+# Also mirrors the built site to the gh-pages branch (legacy / backup hosting).
 
 name: Deploy GitHub Pages
 
@@ -43,6 +44,12 @@ jobs:
           path: website/dist
           include-hidden-files: true
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-dist
+          path: website/dist
+          include-hidden-files: true
+
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -52,3 +59,23 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v5
+
+  gh-pages-branch:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: website-dist
+          path: website/dist
+
+      - name: Push static site to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: website/dist
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: 'deploy: GitHub Pages site'
