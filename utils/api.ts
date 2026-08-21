@@ -67,6 +67,32 @@ export async function setConversationGizmo(
   }
 }
 
+// Verified endpoint: POST /backend-api/conversation/id/{id}/rename with { title }
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function renameConversation(
+  conversationId: string,
+  newTitle: string,
+): Promise<void> {
+  if (!UUID_RE.test(conversationId)) {
+    throw new Error(`renameConversation: invalid conversation ID "${conversationId}"`);
+  }
+  const trimmed = newTitle.trim();
+  if (!trimmed) {
+    throw new Error('renameConversation: newTitle must not be empty');
+  }
+  const res = await backendFetch(
+    `/backend-api/conversation/id/${encodeURIComponent(conversationId)}/rename`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ title: trimmed }),
+    },
+  );
+  if (!res.ok) {
+    throw new Error(`Rename failed for ${conversationId} (HTTP ${res.status})`);
+  }
+}
+
 export type ConversationListItem = {
   id: string;
   title?: string;
