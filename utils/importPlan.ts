@@ -2,12 +2,13 @@ import * as api from './api';
 import { PENDING_PLAN_STORAGE_KEY } from './constants';
 import { normalizeGizmoId } from './dom';
 
-export type PlanAction = 'delete' | 'move' | 'remove-from-project' | 'skip';
+export type PlanAction = 'delete' | 'move' | 'remove-from-project' | 'rename' | 'skip';
 
 export type ImportPlanRow = {
   id: string;
   action: PlanAction;
   targetGizmoId?: string | null;
+  newTitle?: string;
   notes?: string;
   /** Set when row failed validation */
   error?: string;
@@ -23,6 +24,7 @@ export type PlanSummary = {
   delete: number;
   move: number;
   removeFromProject: number;
+  rename: number;
   skip: number;
   invalid: number;
   actionable: number;
@@ -43,6 +45,7 @@ const HEADER_ALIASES: Record<string, string[]> = {
     'project',
     'target_project',
   ],
+  new_title: ['new_title', 'newtitle', 'rename_to', 'title'],
   notes: ['notes', 'note', 'reason', 'comment', 'comments'],
 };
 
@@ -118,6 +121,9 @@ export function normalizePlanAction(raw: string): PlanAction | 'invalid' {
   if (a === 'move' || a === 'moveto' || a === 'assign') {
     return 'move';
   }
+  if (a === 'rename' || a === 'retitle' || a === 'rename-to') {
+    return 'rename';
+  }
   if (
     a === 'remove-from-project' ||
     a === 'remove_from_project' ||
@@ -143,6 +149,7 @@ function parseRow(
   const id = get('id');
   const actionRaw = get('action');
   const targetRaw = get('target_gizmo_id');
+  const newTitleRaw = get('new_title') || undefined;
   const notes = get('notes') || undefined;
 
   if (!id) {
@@ -184,6 +191,13 @@ function parseRow(
     return { id, action: 'remove-from-project', targetGizmoId: null, notes };
   }
 
+  if (action === 'rename') {
+    if (!newTitleRaw) {
+      return { id, action: 'skip', notes, error: 'Rename requires new_title' };
+    }
+    return { id, action: 'rename', newTitle: newTitleRaw, notes };
+  }
+
   return { id, action: 'delete', notes };
 }
 
@@ -222,6 +236,7 @@ export function parseImportJson(text: string, fileName?: string): ImportPlan {
     const targetRaw = String(
       row.target_gizmo_id ?? row.targetGizmoId ?? row.gizmo_id ?? '',
     ).trim();
+    const newTitleRaw = String(row.new_title ?? row.newTitle ?? row.rename_to ?? '').trim();
     const notes = row.notes != null ? String(row.notes) : row.reason != null ? String(row.reason) : undefined;
 
     return parseRow(
@@ -229,9 +244,10 @@ export function parseImportJson(text: string, fileName?: string): ImportPlan {
         id,
         actionRaw,
         targetRaw,
+        newTitleRaw,
         notes ?? '',
       ],
-      { id: 0, action: 1, target_gizmo_id: 2, notes: 3 },
+      { id: 0, action: 1, target_gizmo_id: 2, new_title: 3, notes: 4 },
     );
   });
 
@@ -243,6 +259,7 @@ export function summarizePlan(plan: ImportPlan): PlanSummary {
     delete: 0,
     move: 0,
     removeFromProject: 0,
+    rename: 0,
     skip: 0,
     invalid: 0,
     actionable: 0,
@@ -261,6 +278,7 @@ export function summarizePlan(plan: ImportPlan): PlanSummary {
     if (row.action === 'delete') summary.delete += 1;
     else if (row.action === 'move') summary.move += 1;
     else if (row.action === 'remove-from-project') summary.removeFromProject += 1;
+    else if (row.action === 'rename') summary.rename += 1;
   }
 
   return summary;
@@ -301,6 +319,7 @@ export function formatPlanPreview(plan: ImportPlan): string {
     `  delete: ${s.delete}`,
     `  move: ${s.move}`,
     `  remove from project: ${s.removeFromProject}`,
+    `  rename: ${s.rename}`,
     `  skip: ${s.skip}`,
   ];
   if (s.invalid) lines.push(`  invalid rows: ${s.invalid}`);
@@ -310,7 +329,11 @@ export function formatPlanPreview(plan: ImportPlan): string {
     lines.push('', 'First actions:');
     for (const row of samples) {
       const extra =
-        row.action === 'move' ? ` → ${row.targetGizmoId}` : '';
+        row.action === 'move'
+          ? ` → ${row.targetGizmoId}`
+          : row.action === 'rename'
+            ? ` → "${row.newTitle}"`
+            : '';
       lines.push(`  ${row.action} ${row.id.slice(0, 8)}…${extra}`);
     }
     if (s.actionable > samples.length) {
@@ -332,6 +355,10 @@ export async function executePlanRow(row: ImportPlanRow): Promise<void> {
   }
   if (row.action === 'move' && row.targetGizmoId) {
     await api.setConversationGizmo(row.id, row.targetGizmoId);
+    return;
+  }
+  if (row.action === 'rename' && row.newTitle) {
+    await api.renameConversation(row.id, row.newTitle);
   }
 }
 
