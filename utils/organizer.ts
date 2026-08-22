@@ -959,19 +959,25 @@ async function discoverAllConversations(
   return { conversations: [...map.values()], failedProjects };
 }
 
-// Exponential backoff delays for rate-limit retries (ms). Capped at 60 s.
-const RATE_LIMIT_BACKOFF_MS = [5_000, 10_000, 20_000, 40_000, 60_000];
-const RATE_LIMIT_MAX_DELAY_MS = 60_000;
-// Give up on a single conversation only after waiting 30 minutes total.
-const RATE_LIMIT_MAX_WAIT_MS = 30 * 60 * 1_000;
+// Adaptive pacing state shared across the export loop.
+type PacingState = {
+  delayMs: number;        // current inter-conversation delay
+  successesSince429: number; // consecutive successes since last 429
+};
 
-async function fetchConversationDetailWithRetry(
+// Absolute guard: give up on a single conversation only after 60 min total cooldown.
+const RATE_LIMIT_MAX_TOTAL_WAIT_MS = 60 * 60 * 1_000;
+
+// Thresholds for progressive pacing recovery (consecutive successes needed).
+const RECOVERY_THRESHOLD = 25;
+
+async function fetchConversationDetailWithCooldown(
   id: string,
+  title: string,
   convIndex: number,
   total: number,
-  title: string,
+  pacing: PacingState,
 ): Promise<api.RawConversation> {
-  let attempt = 0;
   let totalWaitedMs = 0;
 
   while (true) {
@@ -980,25 +986,39 @@ async function fetchConversationDetailWithRetry(
     } catch (err) {
       if (!(err instanceof api.RateLimitError)) throw err;
 
-      let delayMs: number;
-      if (err.retryAfterMs > 0) {
-        delayMs = err.retryAfterMs + 1_000; // honour Retry-After + 1 s margin
-      } else {
-        const base = RATE_LIMIT_BACKOFF_MS[Math.min(attempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
-        delayMs = Math.min(base + Math.random() * 2_000, RATE_LIMIT_MAX_DELAY_MS);
+      // A 429 arriving within 3 successes of the last 429 means the quota window
+      // hasn't actually recovered — use an extended cooldown.
+      const quickRecurrence = pacing.successesSince429 < 3;
+      const baseCooldownMs = quickRecurrence ? 180_000 : 60_000;
+      const retryAfterMs = err.retryAfterMs > 0 ? err.retryAfterMs + 1_000 : 0;
+      const cooldownMs = Math.max(baseCooldownMs, retryAfterMs);
+
+      totalWaitedMs += cooldownMs;
+      if (totalWaitedMs > RATE_LIMIT_MAX_TOTAL_WAIT_MS) {
+        throw new Error(`Rate limit: gave up on ${id} after 60 min total cooldown`);
       }
 
-      totalWaitedMs += delayMs;
-      if (totalWaitedMs > RATE_LIMIT_MAX_WAIT_MS) {
-        throw new Error(`Rate limit: gave up after 30 min on ${id}`);
+      // Raise pacing after this cooldown.
+      if (quickRecurrence) {
+        pacing.delayMs = 5_000;
+      } else if (pacing.delayMs < 2_000) {
+        pacing.delayMs = 2_000;
       }
+      pacing.successesSince429 = 0;
 
-      const delaySec = Math.ceil(delayMs / 1_000);
-      setStatus(
-        `Rate limited at ${convIndex} / ${total} — retrying "${title.slice(0, 30)}" in ${delaySec}s`,
-      );
-      await api.sleep(delayMs);
-      attempt++;
+      const totalSec = Math.ceil(cooldownMs / 1_000);
+      const label = quickRecurrence
+        ? `Rate limited again at ${convIndex} / ${total} — Global cooldown ${totalSec}s — switching to 5.0s pacing`
+        : `Rate limited at ${convIndex} / ${total} — Cooling down for ${totalSec}s`;
+      setStatus(label);
+
+      // Countdown — one status update per second.
+      for (let s = totalSec; s > 0; s--) {
+        setStatus(
+          `${quickRecurrence ? 'Rate limited again' : 'Rate limited'} at ${convIndex} / ${total} — Retrying same conversation in ${s}s`,
+        );
+        await api.sleep(1_000);
+      }
     }
   }
 }
@@ -1089,13 +1109,17 @@ async function exportAllEnriched(): Promise<void> {
   let failedCount = 0;
   const total = convList.length;
 
+  // Pacing always starts fresh (1 s). The system self-adapts on 429s.
+  const pacing: PacingState = { delayMs: 1_000, successesSince429: 0 };
+
   for (let i = resumeFrom; i < total; i++) {
     const conv = convList[i];
-    setStatus(`Exporting ${i + 1} / ${total}: ${conv.title.slice(0, 40)}`);
+    const pacingLabel = `${(pacing.delayMs / 1_000).toFixed(1)}s`;
+    setStatus(`Exporting ${i + 1} / ${total}: ${conv.title.slice(0, 40)} — pacing ${pacingLabel}`);
 
     let line: string;
     try {
-      const raw = await fetchConversationDetailWithRetry(conv.id, i + 1, total, conv.title);
+      const raw = await fetchConversationDetailWithCooldown(conv.id, conv.title, i + 1, total, pacing);
       const record = buildExportRecord(raw, conv.id, raw.title ?? conv.title);
       line = JSON.stringify({
         ...record,
@@ -1104,6 +1128,13 @@ async function exportAllEnriched(): Promise<void> {
         source: conv.source,
       });
       okCount++;
+      pacing.successesSince429++;
+      // Progressive pacing recovery: every 25 consecutive successes, step down.
+      if (pacing.delayMs > 1_000 && pacing.successesSince429 % RECOVERY_THRESHOLD === 0) {
+        if (pacing.delayMs >= 5_000) pacing.delayMs = 3_000;
+        else if (pacing.delayMs >= 3_000) pacing.delayMs = 2_000;
+        else pacing.delayMs = 1_000;
+      }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       const errorRecord: EnrichedExportLine = { id: conv.id, title: conv.title, error: errorMsg };
@@ -1117,7 +1148,7 @@ async function exportAllEnriched(): Promise<void> {
     checkpoint.records.push(line);
     await saveExportCheckpoint(checkpoint);
 
-    if (i < total - 1) await api.sleep(1_000);
+    if (i < total - 1) await api.sleep(pacing.delayMs);
   }
 
   const stamp = new Date().toISOString().slice(0, 10);
