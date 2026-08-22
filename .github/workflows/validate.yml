@@ -30,8 +30,8 @@ jobs:
 
       - name: Build extension
         run: npm run build
-      
-            - name: Upload extension build
+
+      - name: Upload extension build
         uses: actions/upload-artifact@v4
         with:
           name: gpt-organizer-extension
