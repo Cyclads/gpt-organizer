@@ -14,6 +14,8 @@ export type LogItem = {
   notes?: string;
   /** Move target project id */
   targetGizmoId?: string | null;
+  /** Rename target title */
+  newTitle?: string;
 };
 
 export type OrganizerLogEntry = {
@@ -99,7 +101,9 @@ function formatItemLine(item: LogItem): string {
   const action = item.action ? ` [${item.action}]` : '';
   const notes = item.notes?.trim() ? ` — ${item.notes.trim()}` : '';
   const target =
-    item.targetGizmoId ? ` → ${item.targetGizmoId}` : '';
+    item.targetGizmoId ? ` → ${item.targetGizmoId}`
+    : item.newTitle ? ` → "${item.newTitle}"`
+    : '';
   const tail = [status, notes, target].filter(Boolean).join('');
   return `${title} (${shortId(item.id)})${action}${tail ? ` · ${tail}` : ''}`;
 }
@@ -201,6 +205,11 @@ export function renderLogEntry(entry: OrganizerLogEntry): HTMLElement {
         const tgt = document.createElement('span');
         tgt.className = 'gpt-organizer-logs-item-target';
         tgt.textContent = `→ ${item.targetGizmoId}`;
+        li.append(document.createTextNode(' '), tgt);
+      } else if (item.newTitle) {
+        const tgt = document.createElement('span');
+        tgt.className = 'gpt-organizer-logs-item-target';
+        tgt.textContent = `→ "${item.newTitle}"`;
         li.append(document.createTextNode(' '), tgt);
       }
 

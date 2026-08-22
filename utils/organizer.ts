@@ -80,6 +80,7 @@ function resultsToLogItems(
       targetGizmoId:
         plan?.action === 'move' ? plan.targetGizmoId
         : options?.targetGizmoId,
+      newTitle: plan?.action === 'rename' ? plan.newTitle : undefined,
     };
   });
 }
@@ -334,13 +335,14 @@ async function handleImportFile(file: File): Promise<void> {
       action: 'import',
       source: 'import-plan',
       reason: `Loaded plan file for review (not applied yet)`,
-      message: `${s.actionable} actionable · delete ${s.delete}, move ${s.move}, remove ${s.removeFromProject}`,
+      message: `${s.actionable} actionable · delete ${s.delete}, move ${s.move}, remove ${s.removeFromProject}, rename ${s.rename}`,
       detail: file.name,
       items: getActionableRows(pendingPlan).slice(0, 50).map((row) => ({
         id: row.id,
         action: row.action,
         notes: row.notes,
         targetGizmoId: row.targetGizmoId,
+        newTitle: row.action === 'rename' ? row.newTitle : undefined,
         ok: undefined,
       })),
     });
@@ -386,7 +388,7 @@ async function applyPendingPlan(): Promise<void> {
 
   const s = summarizePlan(pendingPlan);
   const confirmed = window.confirm(
-    `Apply import plan?\n\nDelete: ${s.delete}\nMove: ${s.move}\nRemove from project: ${s.removeFromProject}\n\nTotal: ${s.actionable} operations. This cannot be undone from the extension.`,
+    `Apply import plan?\n\nDelete: ${s.delete}\nMove: ${s.move}\nRemove from project: ${s.removeFromProject}\nRename: ${s.rename}\n\nTotal: ${s.actionable} operations. This cannot be undone from the extension.`,
   );
   if (!confirmed) return;
 
