@@ -45,7 +45,7 @@ const HEADER_ALIASES: Record<string, string[]> = {
     'project',
     'target_project',
   ],
-  new_title: ['new_title', 'newtitle', 'rename_to', 'title'],
+  new_title: ['new_title', 'newtitle', 'rename_to'],
   notes: ['notes', 'note', 'reason', 'comment', 'comments'],
 };
 
@@ -171,7 +171,22 @@ function parseRow(
   }
 
   if (action === 'skip') {
+    if (newTitleRaw) {
+      return {
+        id,
+        action: 'skip',
+        notes,
+        error: 'new_title is set but action is "skip" — use action=rename for rename-only',
+      };
+    }
     return { id, action: 'skip', notes };
+  }
+
+  if (action === 'rename') {
+    if (!newTitleRaw) {
+      return { id, action: 'skip', notes, error: 'Rename requires new_title' };
+    }
+    return { id, action: 'rename', newTitle: newTitleRaw, notes };
   }
 
   if (action === 'move') {
@@ -184,21 +199,14 @@ function parseRow(
         error: 'Move requires target_gizmo_id',
       };
     }
-    return { id, action: 'move', targetGizmoId, notes };
+    return { id, action: 'move', targetGizmoId, newTitle: newTitleRaw, notes };
   }
 
   if (action === 'remove-from-project') {
-    return { id, action: 'remove-from-project', targetGizmoId: null, notes };
+    return { id, action: 'remove-from-project', targetGizmoId: null, newTitle: newTitleRaw, notes };
   }
 
-  if (action === 'rename') {
-    if (!newTitleRaw) {
-      return { id, action: 'skip', notes, error: 'Rename requires new_title' };
-    }
-    return { id, action: 'rename', newTitle: newTitleRaw, notes };
-  }
-
-  return { id, action: 'delete', notes };
+  return { id, action: 'delete', newTitle: newTitleRaw, notes };
 }
 
 export function parseImportCsv(text: string, fileName?: string): ImportPlan {
@@ -278,7 +286,7 @@ export function summarizePlan(plan: ImportPlan): PlanSummary {
     if (row.action === 'delete') summary.delete += 1;
     else if (row.action === 'move') summary.move += 1;
     else if (row.action === 'remove-from-project') summary.removeFromProject += 1;
-    else if (row.action === 'rename') summary.rename += 1;
+    if (row.newTitle) summary.rename += 1;
   }
 
   return summary;
@@ -328,13 +336,13 @@ export function formatPlanPreview(plan: ImportPlan): string {
   if (samples.length) {
     lines.push('', 'First actions:');
     for (const row of samples) {
-      const extra =
-        row.action === 'move'
-          ? ` → ${row.targetGizmoId}`
-          : row.action === 'rename'
-            ? ` → "${row.newTitle}"`
-            : '';
-      lines.push(`  ${row.action} ${row.id.slice(0, 8)}…${extra}`);
+      const renamePart = row.newTitle ? `rename "${row.newTitle}"` : '';
+      const actionPart =
+        row.action === 'move' ? `move → ${row.targetGizmoId}`
+        : row.action === 'rename' ? ''
+        : row.action;
+      const desc = [renamePart, actionPart].filter(Boolean).join(' + ');
+      lines.push(`  ${row.id.slice(0, 8)}… ${desc}`);
     }
     if (s.actionable > samples.length) {
       lines.push(`  …and ${s.actionable - samples.length} more`);
@@ -344,7 +352,9 @@ export function formatPlanPreview(plan: ImportPlan): string {
   return lines.join('\n');
 }
 
-export async function executePlanRow(row: ImportPlanRow): Promise<void> {
+/** Execute only the primary action (rename excluded). */
+export async function executePrimaryAction(row: ImportPlanRow): Promise<void> {
+  if (row.action === 'rename') return;
   if (row.action === 'delete') {
     await api.deleteConversation(row.id);
     return;
@@ -355,11 +365,14 @@ export async function executePlanRow(row: ImportPlanRow): Promise<void> {
   }
   if (row.action === 'move' && row.targetGizmoId) {
     await api.setConversationGizmo(row.id, row.targetGizmoId);
-    return;
   }
-  if (row.action === 'rename' && row.newTitle) {
+}
+
+export async function executePlanRow(row: ImportPlanRow): Promise<void> {
+  if (row.newTitle) {
     await api.renameConversation(row.id, row.newTitle);
   }
+  await executePrimaryAction(row);
 }
 
 export function parseImportFile(

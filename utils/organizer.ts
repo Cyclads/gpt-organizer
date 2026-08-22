@@ -31,6 +31,7 @@ import {
 } from './metadata';
 import {
   executePlanRow,
+  executePrimaryAction,
   formatPlanPreview,
   getActionableRows,
   loadPendingPlan,
@@ -80,7 +81,7 @@ function resultsToLogItems(
       targetGizmoId:
         plan?.action === 'move' ? plan.targetGizmoId
         : options?.targetGizmoId,
-      newTitle: plan?.action === 'rename' ? plan.newTitle : undefined,
+      newTitle: plan?.newTitle,
     };
   });
 }
@@ -342,7 +343,7 @@ async function handleImportFile(file: File): Promise<void> {
         action: row.action,
         notes: row.notes,
         targetGizmoId: row.targetGizmoId,
-        newTitle: row.action === 'rename' ? row.newTitle : undefined,
+        newTitle: row.newTitle,
         ok: undefined,
       })),
     });
@@ -363,8 +364,15 @@ async function handleImportFile(file: File): Promise<void> {
 }
 
 async function executePlanRowWithFallback(row: ImportPlanRow): Promise<void> {
+  // rename step: no fallback — failure aborts the entire row
+  if (row.newTitle) {
+    await api.renameConversation(row.id, row.newTitle);
+  }
+  if (row.action === 'rename') return;
+
+  // primary action: UI fallback for move only
   try {
-    await executePlanRow(row);
+    await executePrimaryAction(row);
   } catch (firstErr) {
     if (row.action === 'move' && row.targetGizmoId) {
       await moveViaUi(row.id, row.targetGizmoId);
@@ -388,7 +396,7 @@ async function applyPendingPlan(): Promise<void> {
 
   const s = summarizePlan(pendingPlan);
   const confirmed = window.confirm(
-    `Apply import plan?\n\nDelete: ${s.delete}\nMove: ${s.move}\nRemove from project: ${s.removeFromProject}\nRename: ${s.rename}\n\nTotal: ${s.actionable} operations. This cannot be undone from the extension.`,
+    `Apply import plan?\n\nDelete: ${s.delete}\nMove: ${s.move}\nRemove from project: ${s.removeFromProject}\nRename: ${s.rename}\n\nConversations affected: ${s.actionable}. This cannot be undone from the extension.`,
   );
   if (!confirmed) return;
 

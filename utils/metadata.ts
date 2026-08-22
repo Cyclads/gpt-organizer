@@ -118,6 +118,7 @@ export function metadataToCsv(rows: ConversationMetadata[]): string {
   const headers = [
     'id',
     'title',
+    'new_title',
     'href',
     'project_gizmo_id',
     'unread',

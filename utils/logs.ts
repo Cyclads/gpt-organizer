@@ -100,10 +100,12 @@ function formatItemLine(item: LogItem): string {
     : '';
   const action = item.action ? ` [${item.action}]` : '';
   const notes = item.notes?.trim() ? ` — ${item.notes.trim()}` : '';
-  const target =
-    item.targetGizmoId ? ` → ${item.targetGizmoId}`
-    : item.newTitle ? ` → "${item.newTitle}"`
-    : '';
+  const targetParts: string[] = [];
+  if (item.newTitle) targetParts.push(`rename → "${item.newTitle}"`);
+  if (item.targetGizmoId) {
+    targetParts.push(item.newTitle ? `move → ${item.targetGizmoId}` : `→ ${item.targetGizmoId}`);
+  }
+  const target = targetParts.length ? ` ${targetParts.join(', ')}` : '';
   const tail = [status, notes, target].filter(Boolean).join('');
   return `${title} (${shortId(item.id)})${action}${tail ? ` · ${tail}` : ''}`;
 }
@@ -201,15 +203,16 @@ export function renderLogEntry(entry: OrganizerLogEntry): HTMLElement {
         li.append(document.createTextNode(' '), act);
       }
 
+      if (item.newTitle) {
+        const tgt = document.createElement('span');
+        tgt.className = 'gpt-organizer-logs-item-target';
+        tgt.textContent = `rename → "${item.newTitle}"`;
+        li.append(document.createTextNode(' '), tgt);
+      }
       if (item.targetGizmoId) {
         const tgt = document.createElement('span');
         tgt.className = 'gpt-organizer-logs-item-target';
-        tgt.textContent = `→ ${item.targetGizmoId}`;
-        li.append(document.createTextNode(' '), tgt);
-      } else if (item.newTitle) {
-        const tgt = document.createElement('span');
-        tgt.className = 'gpt-organizer-logs-item-target';
-        tgt.textContent = `→ "${item.newTitle}"`;
+        tgt.textContent = item.newTitle ? `move → ${item.targetGizmoId}` : `→ ${item.targetGizmoId}`;
         li.append(document.createTextNode(' '), tgt);
       }
 
