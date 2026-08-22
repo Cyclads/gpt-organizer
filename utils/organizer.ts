@@ -853,10 +853,16 @@ type DiscoveredConversation = {
   source: 'no_project' | 'project';
 };
 
+type DiscoveryResult = {
+  conversations: DiscoveredConversation[];
+  failedProjects: Array<{ title: string; id: string; error: string }>;
+};
+
 async function discoverAllConversations(
   onStatus: (msg: string) => void,
-): Promise<DiscoveredConversation[]> {
+): Promise<DiscoveryResult> {
   const map = new Map<string, DiscoveredConversation>();
+  const failedProjects: Array<{ title: string; id: string; error: string }> = [];
   const limit = 100;
 
   // Phase 1 — Main conversation list (includes conversations with gizmo_id set).
@@ -897,34 +903,44 @@ async function discoverAllConversations(
   for (const project of projects) {
     const pId = normalizeGizmoId(project.id) ?? project.id;
     onStatus(`Discovering project "${project.title}"…`);
-    for (let offset = 0; offset < 100_000; offset += limit) {
-      const page = await api.fetchProjectConversationsPage(pId, offset, limit);
-      for (const item of page.items) {
-        if (!item.id) continue;
-        if (map.has(item.id)) {
-          // Already found — ensure project info is filled (more specific than gizmo_id alone).
-          const existing = map.get(item.id)!;
-          if (!existing.projectName) {
-            existing.gizmoId = pId;
-            existing.projectName = project.title;
-            existing.source = 'project';
+    let cursor = '0';
+    try {
+      for (let pageNum = 0; pageNum < 200; pageNum++) {
+        const result = await api.fetchProjectConversationsPage(pId, cursor, limit);
+        for (const item of result.items) {
+          if (!item.id) continue;
+          if (map.has(item.id)) {
+            const existing = map.get(item.id)!;
+            if (!existing.projectName) {
+              existing.gizmoId = pId;
+              existing.projectName = project.title;
+              existing.source = 'project';
+            }
+          } else {
+            map.set(item.id, {
+              id: item.id,
+              title: item.title ?? item.id,
+              gizmoId: pId,
+              projectName: project.title,
+              source: 'project',
+            });
           }
-        } else {
-          map.set(item.id, {
-            id: item.id,
-            title: item.title ?? item.id,
-            gizmoId: pId,
-            projectName: project.title,
-            source: 'project',
-          });
         }
+        if (!result.nextCursor || result.nextCursor === cursor) break;
+        cursor = result.nextCursor;
+        await api.sleep(DELETE_DELAY_MS);
       }
-      if (!page.hasMore) break;
-      await api.sleep(DELETE_DELAY_MS);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `${LOG_PREFIX} Phase 3: skipping project "${project.title}" (${pId}):`,
+        errMsg,
+      );
+      failedProjects.push({ title: project.title, id: pId, error: errMsg });
     }
   }
 
-  return [...map.values()];
+  return { conversations: [...map.values()], failedProjects };
 }
 
 async function exportAllEnriched(): Promise<void> {
@@ -933,11 +949,25 @@ async function exportAllEnriched(): Promise<void> {
 
   // Discovery phase.
   let discovered: DiscoveredConversation[];
+  let failedProjects: Array<{ title: string; id: string; error: string }>;
   try {
-    discovered = await discoverAllConversations(setStatus);
+    ({ conversations: discovered, failedProjects } = await discoverAllConversations(setStatus));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     setStatus(`Discovery failed: ${msg}`, true);
+    busy = false;
+    applyRootDataset();
+    return;
+  }
+
+  if (failedProjects.length > 0) {
+    const names = failedProjects.map((p) => `"${p.title}" (${p.id})`).join(', ');
+    const summary = `Discovery incomplete: ${failedProjects.length} project(s) failed — ${names}`;
+    console.error(`${LOG_PREFIX} ${summary}`);
+    for (const p of failedProjects) {
+      console.error(`${LOG_PREFIX}   • "${p.title}" (${p.id}): ${p.error}`);
+    }
+    setStatus(summary, true);
     busy = false;
     applyRootDataset();
     return;

@@ -157,29 +157,33 @@ export async function fetchConversationsPage(
   return { items, hasMore };
 }
 
-// Confirmed endpoint (probe, Jun 2026): GET /backend-api/gizmos/{gizmoId}/conversations
-// Response shape assumed to match /backend-api/conversations (same item structure, same pagination).
+// Confirmed endpoint (captured Jun 2026):
+//   GET /backend-api/gizmos/{gizmoId}/conversations?cursor=0&limit=N&owned_only=true
+// Uses cursor-based pagination, NOT offset. First call uses cursor="0".
+// The response cursor field (next_cursor / cursor) provides the value for the next call.
+// owned_only=true is required — omitting it returns HTTP 422.
 export async function fetchProjectConversationsPage(
   gizmoId: string,
-  offset: number,
+  cursor: string,
   limit: number,
-): Promise<{ items: ConversationListItem[]; hasMore: boolean }> {
+): Promise<{ items: ConversationListItem[]; nextCursor: string | null }> {
   const params = new URLSearchParams({
-    offset: String(offset),
+    cursor,
     limit: String(limit),
-    order: 'updated',
+    owned_only: 'true',
   });
   const res = await backendFetch(
     `/backend-api/gizmos/${encodeURIComponent(gizmoId)}/conversations?${params}`,
     { method: 'GET' },
   );
   if (!res.ok) {
-    throw new Error(`Project conversations failed for ${gizmoId} (HTTP ${res.status})`);
+    throw new Error(`Project conversations failed for "${gizmoId}" (HTTP ${res.status})`);
   }
   const data = (await res.json()) as {
     items?: unknown[];
-    has_more?: boolean;
-    hasMore?: boolean;
+    // Support both field names defensively — actual field name to be confirmed on first run.
+    next_cursor?: string | number | null;
+    cursor?: string | number | null;
   };
   const items: ConversationListItem[] = [];
   for (const raw of Array.isArray(data.items) ? data.items : []) {
@@ -199,8 +203,10 @@ export async function fetchProjectConversationsPage(
       snippet: row.snippet as string | undefined,
     });
   }
-  const hasMore = data.has_more === true || data.hasMore === true;
-  return { items, hasMore };
+  // Prefer next_cursor, fall back to cursor. Null / undefined / same-as-current = no more pages.
+  const rawNext = data.next_cursor ?? data.cursor ?? null;
+  const nextCursor = rawNext != null ? String(rawNext) : null;
+  return { items, nextCursor };
 }
 
 export async function fetchProjects(): Promise<GptProject[]> {
