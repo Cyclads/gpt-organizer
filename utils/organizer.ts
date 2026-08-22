@@ -47,6 +47,12 @@ import {
   type ImportPlanRow,
 } from './importPlan';
 import { SidebarSelection } from './sidebarSelection';
+import {
+  clearExportCheckpoint,
+  loadExportCheckpoint,
+  saveExportCheckpoint,
+  type ExportCheckpoint,
+} from './exportCheckpoint';
 import { loadUiState, saveUiState, type OrganizerUiState } from './storage';
 import type { BatchResult, GptProject } from './types';
 
@@ -953,21 +959,92 @@ async function discoverAllConversations(
   return { conversations: [...map.values()], failedProjects };
 }
 
-async function exportAllEnriched(): Promise<void> {
-  busy = true;
-  applyRootDataset();
+// Exponential backoff delays for rate-limit retries (ms). Capped at 60 s.
+const RATE_LIMIT_BACKOFF_MS = [5_000, 10_000, 20_000, 40_000, 60_000];
+const RATE_LIMIT_MAX_DELAY_MS = 60_000;
+// Give up on a single conversation only after waiting 30 minutes total.
+const RATE_LIMIT_MAX_WAIT_MS = 30 * 60 * 1_000;
 
-  // Discovery phase.
-  let discovered: DiscoveredConversation[];
+async function fetchConversationDetailWithRetry(
+  id: string,
+  convIndex: number,
+  total: number,
+  title: string,
+): Promise<api.RawConversation> {
+  let attempt = 0;
+  let totalWaitedMs = 0;
+
+  while (true) {
+    try {
+      return await api.fetchConversationDetail(id);
+    } catch (err) {
+      if (!(err instanceof api.RateLimitError)) throw err;
+
+      let delayMs: number;
+      if (err.retryAfterMs > 0) {
+        delayMs = err.retryAfterMs + 1_000; // honour Retry-After + 1 s margin
+      } else {
+        const base = RATE_LIMIT_BACKOFF_MS[Math.min(attempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
+        delayMs = Math.min(base + Math.random() * 2_000, RATE_LIMIT_MAX_DELAY_MS);
+      }
+
+      totalWaitedMs += delayMs;
+      if (totalWaitedMs > RATE_LIMIT_MAX_WAIT_MS) {
+        throw new Error(`Rate limit: gave up after 30 min on ${id}`);
+      }
+
+      const delaySec = Math.ceil(delayMs / 1_000);
+      setStatus(
+        `Rate limited at ${convIndex} / ${total} — retrying "${title.slice(0, 30)}" in ${delaySec}s`,
+      );
+      await api.sleep(delayMs);
+      attempt++;
+    }
+  }
+}
+
+type ExportStartState = {
+  checkpoint: ExportCheckpoint;
+  convList: DiscoveredConversation[];
+  resumeFrom: number;
+  accumulatedLines: string[];
+  okCount: number;
+};
+
+async function resolveExportStartState(): Promise<ExportStartState | null> {
+  const existing = await loadExportCheckpoint();
+
+  if (existing) {
+    const completedCount = existing.completedIds.length;
+    const totalCount = existing.conversations.length;
+    const doResume = window.confirm(
+      `Resume export: ${completedCount} / ${totalCount} already completed.\n\nOK = resume from where it stopped\nCancel = start fresh (existing progress will be lost)`,
+    );
+    if (doResume) {
+      const done = new Set(existing.completedIds);
+      let resumeFrom = existing.conversations.findIndex((c) => !done.has(c.id));
+      if (resumeFrom === -1) resumeFrom = totalCount;
+      setStatus(`Resuming export: ${completedCount} / ${totalCount} already completed`);
+      await api.sleep(500);
+      return {
+        checkpoint: existing,
+        convList: existing.conversations as DiscoveredConversation[],
+        resumeFrom,
+        accumulatedLines: [...existing.records],
+        okCount: completedCount,
+      };
+    }
+    await clearExportCheckpoint();
+  }
+
+  // Fresh discovery.
+  let conversations: DiscoveredConversation[];
   let failedProjects: Array<{ title: string; id: string; error: string }>;
   try {
-    ({ conversations: discovered, failedProjects } = await discoverAllConversations(setStatus));
+    ({ conversations, failedProjects } = await discoverAllConversations(setStatus));
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    setStatus(`Discovery failed: ${msg}`, true);
-    busy = false;
-    applyRootDataset();
-    return;
+    setStatus(`Discovery failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    return null;
   }
 
   if (failedProjects.length > 0) {
@@ -978,62 +1055,90 @@ async function exportAllEnriched(): Promise<void> {
       console.error(`${LOG_PREFIX}   • "${p.title}" (${p.id}): ${p.error}`);
     }
     setStatus(summary, true);
+    return null;
+  }
+
+  const checkpoint: ExportCheckpoint = {
+    version: 1,
+    startedAt: new Date().toISOString(),
+    conversations,
+    completedIds: [],
+    records: [],
+  };
+  await saveExportCheckpoint(checkpoint);
+
+  setStatus(`Found ${conversations.length} conversations — exporting…`);
+  await api.sleep(200);
+
+  return { checkpoint, convList: conversations, resumeFrom: 0, accumulatedLines: [], okCount: 0 };
+}
+
+async function exportAllEnriched(): Promise<void> {
+  busy = true;
+  applyRootDataset();
+
+  const state = await resolveExportStartState();
+  if (!state) {
     busy = false;
     applyRootDataset();
     return;
   }
 
-  setStatus(`Found ${discovered.length} conversations — exporting…`);
-  await api.sleep(200);
+  const { checkpoint, convList, resumeFrom, accumulatedLines } = state;
+  let okCount = state.okCount;
+  let failedCount = 0;
+  const total = convList.length;
 
-  // Export phase — sequential, one conversation at a time.
-  const lines: string[] = [];
-  let ok = 0;
-  let failed = 0;
+  for (let i = resumeFrom; i < total; i++) {
+    const conv = convList[i];
+    setStatus(`Exporting ${i + 1} / ${total}: ${conv.title.slice(0, 40)}`);
 
-  for (let i = 0; i < discovered.length; i++) {
-    const conv = discovered[i];
-    setStatus(`Exporting ${i + 1} / ${discovered.length}: ${conv.title.slice(0, 40)}`);
+    let line: string;
     try {
-      const raw = await api.fetchConversationDetail(conv.id);
+      const raw = await fetchConversationDetailWithRetry(conv.id, i + 1, total, conv.title);
       const record = buildExportRecord(raw, conv.id, raw.title ?? conv.title);
-      lines.push(
-        JSON.stringify({
-          ...record,
-          project_gizmo_id: conv.gizmoId,
-          project_name: conv.projectName,
-          source: conv.source,
-        }),
-      );
-      ok++;
+      line = JSON.stringify({
+        ...record,
+        project_gizmo_id: conv.gizmoId,
+        project_name: conv.projectName,
+        source: conv.source,
+      });
+      okCount++;
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      const errorLine: EnrichedExportLine = { id: conv.id, title: conv.title, error: errorMsg };
-      lines.push(JSON.stringify(errorLine));
-      failed++;
-      console.warn(LOG_PREFIX, `exportAllEnriched: failed for ${conv.id}:`, errorMsg);
+      const errorRecord: EnrichedExportLine = { id: conv.id, title: conv.title, error: errorMsg };
+      line = JSON.stringify(errorRecord);
+      failedCount++;
+      console.warn(LOG_PREFIX, `exportAllEnriched: non-retryable failure for ${conv.id}:`, errorMsg);
     }
-    if (i < discovered.length - 1) await api.sleep(DELETE_DELAY_MS);
+
+    accumulatedLines.push(line);
+    checkpoint.completedIds.push(conv.id);
+    checkpoint.records.push(line);
+    await saveExportCheckpoint(checkpoint);
+
+    if (i < total - 1) await api.sleep(1_000);
   }
 
   const stamp = new Date().toISOString().slice(0, 10);
-  downloadJsonl(`gpt-organizer-all-enriched-${stamp}.jsonl`, lines);
+  downloadJsonl(`gpt-organizer-all-enriched-${stamp}.jsonl`, accumulatedLines);
+  await clearExportCheckpoint();
 
   appendLog({
-    level: failed ? 'error' : 'success',
+    level: failedCount ? 'error' : 'success',
     action: 'export-all-enriched',
     source: 'manual',
     reason: 'User exported all conversations (enriched JSONL, no selection required)',
-    message: `${ok} exported${failed ? `, ${failed} failed` : ''} — ${discovered.length} total`,
+    message: `${okCount} exported${failedCount ? `, ${failedCount} failed` : ''} — ${total} total`,
   });
   renderLogs();
 
   busy = false;
   applyRootDataset();
   setStatus(
-    failed
-      ? `All enriched: ${ok} ok, ${failed} errors — see JSONL`
-      : `All enriched: exported ${ok} conversations`,
+    failedCount
+      ? `All enriched: ${okCount} ok, ${failedCount} errors — see JSONL`
+      : `All enriched: exported ${okCount} conversations`,
   );
 }
 

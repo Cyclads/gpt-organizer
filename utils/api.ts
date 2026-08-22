@@ -6,6 +6,13 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export class RateLimitError extends Error {
+  constructor(public readonly retryAfterMs: number) {
+    super(`Rate limited — retry after ${Math.ceil(retryAfterMs / 1000)}s`);
+    this.name = 'RateLimitError';
+  }
+}
+
 export async function getAccessToken(): Promise<string> {
   const res = await fetch('/api/auth/session', {
     method: 'GET',
@@ -340,6 +347,11 @@ export async function fetchConversationDetail(conversationId: string): Promise<R
     `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
     { method: 'GET' },
   );
+  if (res.status === 429) {
+    const retryAfterHeader = res.headers.get('Retry-After');
+    const retryAfterMs = retryAfterHeader ? parseFloat(retryAfterHeader) * 1000 : 0;
+    throw new RateLimitError(retryAfterMs > 0 ? retryAfterMs : 0);
+  }
   if (!res.ok) {
     throw new Error(`Fetch conversation failed for ${conversationId} (HTTP ${res.status})`);
   }
