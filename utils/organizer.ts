@@ -49,6 +49,7 @@ let ui: OrganizerUiState = loadUiState();
 let busy = false;
 let pendingPlan: ImportPlan | null = loadPendingPlan();
 let importListenerBound = false;
+let bodyRootWatcher: MutationObserver | null = null;
 
 const selection = new SidebarSelection(() => updateCount());
 
@@ -200,6 +201,22 @@ function removeCheckboxArtifacts(): void {
   selection.removeAllCheckboxDom();
 }
 
+function watchBodyForRootRemoval(): void {
+  if (bodyRootWatcher) return;
+  bodyRootWatcher = new MutationObserver((mutations) => {
+    const rootGone = mutations.some(
+      (m) =>
+        m.type === 'childList' &&
+        [...m.removedNodes].some((n) => n instanceof Element && n.id === ROOT_ID),
+    );
+    if (rootGone) {
+      console.warn(`${LOG_PREFIX} [DIAG] bodyRootWatcher: root removed — re-injecting`);
+      ensureToolbar();
+    }
+  });
+  bodyRootWatcher.observe(document.body, { childList: true });
+}
+
 function ensureToolbar(): HTMLElement {
   let root = document.getElementById(ROOT_ID);
   if (root) {
@@ -294,6 +311,7 @@ function ensureToolbar(): HTMLElement {
 
   document.body.appendChild(root);
   console.info(`${LOG_PREFIX} [DIAG] ensureToolbar: root appended to document.body`);
+  watchBodyForRootRemoval();
   void refreshProjectSelect();
   bindImportFileInput();
   renderImportPreview();
