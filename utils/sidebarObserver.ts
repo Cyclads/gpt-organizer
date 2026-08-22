@@ -1,5 +1,6 @@
 import { findSidebarContainer } from './dom';
 import { SELECTORS } from './selectors';
+import { LOG_PREFIX } from './constants';
 
 export type SidebarObserverOptions = {
   onSync: () => void;
@@ -45,6 +46,7 @@ export function startSidebarObserver(options: SidebarObserverOptions): () => voi
   let subtreeObserver: MutationObserver | null = null;
 
   const runSync = () => {
+    console.info(`${LOG_PREFIX} [DIAG] runSync() called — observedRoot:`, observedRoot, '— observedRoot connected:', observedRoot?.isConnected);
     attachToCurrentSidebar();
     onSync();
   };
@@ -68,6 +70,7 @@ export function startSidebarObserver(options: SidebarObserverOptions): () => voi
     const nextRoot = findSidebarContainer() ?? document.body;
     if (nextRoot === observedRoot && subtreeObserver) return;
 
+    console.info(`${LOG_PREFIX} [DIAG] observer switching root:`, { from: observedRoot, to: nextRoot, fromConnected: observedRoot?.isConnected });
     subtreeObserver?.disconnect();
     observedRoot = nextRoot;
     subtreeObserver = new MutationObserver(onMutations);
@@ -103,6 +106,7 @@ export function startSidebarObserver(options: SidebarObserverOptions): () => voi
   window.addEventListener('popstate', scheduleSync);
   window.addEventListener('hashchange', scheduleSync);
 
+  console.info(`${LOG_PREFIX} [DIAG] startSidebarObserver: attaching — document.body =`, document.body);
   attachToCurrentSidebar();
   scheduleSync();
 

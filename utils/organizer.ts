@@ -191,6 +191,7 @@ function renderLogs(): void {
 }
 
 export function syncCheckboxes(): void {
+  console.info(`${LOG_PREFIX} [DIAG] syncCheckboxes called — root present: ${!!document.getElementById(ROOT_ID)}`);
   ensureToolbar();
   selection.sync(ui.enabled);
 }
@@ -201,8 +202,12 @@ function removeCheckboxArtifacts(): void {
 
 function ensureToolbar(): HTMLElement {
   let root = document.getElementById(ROOT_ID);
-  if (root) return root;
+  if (root) {
+    console.info(`${LOG_PREFIX} [DIAG] ensureToolbar: root already exists`);
+    return root;
+  }
 
+  console.warn(`${LOG_PREFIX} [DIAG] ensureToolbar: root NOT found — creating new root. document.body =`, document.body);
   importListenerBound = false;
   root = document.createElement('div');
   root.id = ROOT_ID;
@@ -288,6 +293,7 @@ function ensureToolbar(): HTMLElement {
   });
 
   document.body.appendChild(root);
+  console.info(`${LOG_PREFIX} [DIAG] ensureToolbar: root appended to document.body`);
   void refreshProjectSelect();
   bindImportFileInput();
   renderImportPreview();
@@ -834,6 +840,7 @@ async function handleAction(action: string): Promise<void> {
 }
 
 export function mount(): void {
+  console.info(`${LOG_PREFIX} [DIAG] mount() called`);
   ui = loadUiState();
   selection.clear();
 

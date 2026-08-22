@@ -20,7 +20,12 @@ export default defineContentScript({
   matches: [...CHATGPT_MATCHES],
   runAt: 'document_idle',
   main() {
-    if ((window as unknown as Record<string, boolean>)[BOOTSTRAP_FLAG]) return;
+    console.info(`${LOG_PREFIX} [DIAG] content script fired (document.readyState=${document.readyState})`);
+
+    if ((window as unknown as Record<string, boolean>)[BOOTSTRAP_FLAG]) {
+      console.warn(`${LOG_PREFIX} [DIAG] BOOTSTRAP_FLAG already set — skipping init`);
+      return;
+    }
     (window as unknown as Record<string, boolean>)[BOOTSTRAP_FLAG] = true;
 
     mount();
@@ -28,6 +33,25 @@ export default defineContentScript({
       onSync: syncCheckboxes,
       isOrganizerNode,
     });
+
+    // DIAG: watch for body reference change and root disappearing
+    let lastBody = document.body;
+    let rootWasPresent = !!document.getElementById(ROOT_ID);
+    setInterval(() => {
+      const bodyChanged = document.body !== lastBody;
+      const rootNow = !!document.getElementById(ROOT_ID);
+      if (bodyChanged) {
+        console.warn(`${LOG_PREFIX} [DIAG] document.body reference CHANGED`, { old: lastBody, new: document.body });
+        lastBody = document.body;
+      }
+      if (rootWasPresent && !rootNow) {
+        console.error(`${LOG_PREFIX} [DIAG] gpt-organizer-root DISAPPEARED from DOM`);
+      }
+      if (!rootWasPresent && rootNow) {
+        console.info(`${LOG_PREFIX} [DIAG] gpt-organizer-root RE-APPEARED in DOM`);
+      }
+      rootWasPresent = rootNow;
+    }, 500);
 
     console.info(`${LOG_PREFIX} loaded (local, unpublished)`);
   },
