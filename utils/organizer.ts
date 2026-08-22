@@ -863,25 +863,34 @@ async function discoverAllConversations(
 ): Promise<DiscoveryResult> {
   const map = new Map<string, DiscoveredConversation>();
   const failedProjects: Array<{ title: string; id: string; error: string }> = [];
-  const limit = 100;
+  const mainLimit = 28;
   const projectLimit = 5;
 
   // Phase 1 — Main conversation list (includes conversations with gizmo_id set).
   onStatus('Discovering conversations (main list)…');
-  for (let offset = 0; offset < 100_000; offset += limit) {
-    const page = await api.fetchConversationsPage(offset, limit);
-    for (const item of page.items) {
-      if (!item.id) continue;
-      map.set(item.id, {
-        id: item.id,
-        title: item.title ?? item.id,
-        gizmoId: item.gizmo_id ?? null,
-        projectName: null,
-        source: item.gizmo_id ? 'project' : 'no_project',
-      });
+  {
+    let offset = 0;
+    let pageNum = 0;
+    const maxPages = 5000;
+    while (pageNum < maxPages) {
+      const page = await api.fetchConversationsPage(offset, mainLimit);
+      for (const item of page.items) {
+        if (!item.id) continue;
+        map.set(item.id, {
+          id: item.id,
+          title: item.title ?? item.id,
+          gizmoId: item.gizmo_id ?? null,
+          projectName: null,
+          source: item.gizmo_id ? 'project' : 'no_project',
+        });
+      }
+      pageNum++;
+      if (page.items.length === 0) break;
+      if (typeof page.total === 'number' && offset + page.items.length >= page.total) break;
+      offset += page.items.length;
+      await api.sleep(DELETE_DELAY_MS);
     }
-    if (!page.hasMore) break;
-    await api.sleep(DELETE_DELAY_MS);
+    console.info(`${LOG_PREFIX} Main conversations: ${map.size} discovered across ${pageNum} pages`);
   }
 
   // Phase 2 — Projects: resolve names + fetch their conversation lists.

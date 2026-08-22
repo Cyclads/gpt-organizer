@@ -114,11 +114,14 @@ export type ConversationListItem = {
 export async function fetchConversationsPage(
   offset: number,
   limit: number,
-): Promise<{ items: ConversationListItem[]; hasMore: boolean }> {
+): Promise<{ items: ConversationListItem[]; hasMore: boolean; total?: number }> {
   const params = new URLSearchParams({
     offset: String(offset),
     limit: String(limit),
     order: 'updated',
+    is_archived: 'false',
+    is_starred: 'false',
+    hide_snorlax: 'true',
   });
 
   const res = await backendFetch(`/backend-api/conversations?${params}`, {
@@ -132,6 +135,7 @@ export async function fetchConversationsPage(
     items?: unknown[];
     has_more?: boolean;
     hasMore?: boolean;
+    total?: number;
   };
 
   const items: ConversationListItem[] = [];
@@ -154,7 +158,7 @@ export async function fetchConversationsPage(
   }
 
   const hasMore = data.has_more === true || data.hasMore === true;
-  return { items, hasMore };
+  return { items, hasMore, total: typeof data.total === 'number' ? data.total : undefined };
 }
 
 // Confirmed endpoint (captured Jun 2026):
