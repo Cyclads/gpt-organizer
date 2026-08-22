@@ -202,6 +202,42 @@ export async function fetchProjects(): Promise<GptProject[]> {
   });
 }
 
+export type RawConversationNode = {
+  id: string;
+  parent?: string | null;
+  children?: string[];
+  message?: {
+    author?: { role?: string };
+    content?: {
+      content_type?: string;
+      parts?: unknown[];
+    };
+    create_time?: number | null;
+  } | null;
+};
+
+export type RawConversation = {
+  title?: string;
+  create_time?: number | null;
+  update_time?: number | null;
+  gizmo_id?: string | null;
+  is_archived?: boolean;
+  is_starred?: boolean | null;
+  current_node?: string;
+  mapping?: Record<string, RawConversationNode>;
+};
+
+export async function fetchConversationDetail(conversationId: string): Promise<RawConversation> {
+  const res = await backendFetch(
+    `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
+    { method: 'GET' },
+  );
+  if (!res.ok) {
+    throw new Error(`Fetch conversation failed for ${conversationId} (HTTP ${res.status})`);
+  }
+  return res.json() as Promise<RawConversation>;
+}
+
 export async function runBatch(
   items: string[],
   worker: (id: string) => Promise<void>,

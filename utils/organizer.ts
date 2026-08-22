@@ -24,11 +24,17 @@ import {
   buildMetadataForSelection,
   downloadCsv,
   downloadJson,
+  downloadJsonl,
   fetchApiMetadataForIds,
   metadataFromSidebarRow,
   metadataToCsv,
   type ConversationMetadata,
 } from './metadata';
+import {
+  buildExportRecord,
+  toJsonlLine,
+  type EnrichedExportLine,
+} from './conversationSampler';
 import {
   executePlanRow,
   executePrimaryAction,
@@ -268,6 +274,7 @@ function ensureToolbar(): HTMLElement {
           <div class="gpt-organizer-actions">
             <button type="button" data-action="export-json">Export JSON</button>
             <button type="button" data-action="export-csv">Export CSV</button>
+            <button type="button" data-action="export-enriched">Export enriched</button>
           </div>
           <div class="gpt-organizer-import">
             <label class="gpt-organizer-file-label">
@@ -646,6 +653,70 @@ async function exportMetadata(format: 'json' | 'csv'): Promise<void> {
   setStatus(`Exported ${rows.length} conversation(s) as ${format.toUpperCase()}`);
 }
 
+async function exportEnriched(): Promise<void> {
+  const ids = [...selection.selected];
+  if (!ids.length) {
+    setStatus('Select conversations first', true);
+    return;
+  }
+
+  busy = true;
+  applyRootDataset();
+
+  // Build a title map from visible sidebar rows for progress labels.
+  const visibleTitles = new Map(
+    findVisibleConversations()
+      .filter((c) => selection.selected.has(c.id))
+      .map((c) => [c.id, c.title]),
+  );
+
+  const lines: string[] = [];
+  let ok = 0;
+  let failed = 0;
+
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    const title = visibleTitles.get(id) ?? id;
+    setStatus(`Fetching ${i + 1}/${ids.length}: ${title.slice(0, 40)}`);
+
+    try {
+      const raw = await api.fetchConversationDetail(id);
+      const record = buildExportRecord(raw, id, raw.title ?? title);
+      lines.push(toJsonlLine(record));
+      ok++;
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorLine: EnrichedExportLine = { id, title, error: errorMsg };
+      lines.push(toJsonlLine(errorLine));
+      failed++;
+      console.warn(LOG_PREFIX, `exportEnriched: failed for ${id}:`, errorMsg);
+    }
+
+    if (i < ids.length - 1) await api.sleep(DELETE_DELAY_MS);
+  }
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  downloadJsonl(`gpt-organizer-enriched-${stamp}.jsonl`, lines);
+
+  appendLog({
+    level: failed ? 'error' : 'success',
+    action: 'export-enriched',
+    source: 'manual',
+    reason: `User exported enriched JSONL for sidebar selection`,
+    message: `${ok} exported${failed ? `, ${failed} failed` : ''}`,
+    conversationIds: ids,
+  });
+  renderLogs();
+
+  busy = false;
+  applyRootDataset();
+  setStatus(
+    failed
+      ? `Exported ${ok} conversation(s) — ${failed} error(s), see JSONL`
+      : `Exported ${ok} conversation(s) as enriched JSONL`,
+  );
+}
+
 async function moveSelected(): Promise<void> {
   const select = document.getElementById('gpt-organizer-project-select');
   if (!(select instanceof HTMLSelectElement) || !select.value) {
@@ -833,6 +904,9 @@ async function handleAction(action: string): Promise<void> {
       break;
     case 'export-csv':
       await exportMetadata('csv');
+      break;
+    case 'export-enriched':
+      await exportEnriched();
       break;
     case 'apply-plan':
       await applyPendingPlan();
