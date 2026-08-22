@@ -202,6 +202,30 @@ export async function fetchProjects(): Promise<GptProject[]> {
   });
 }
 
+export async function createProject(name: string): Promise<string> {
+  const res = await backendFetch('/backend-api/projects', {
+    method: 'POST',
+    body: JSON.stringify({ instructions: '', name: name.trim(), memory_scope: 'unset' }),
+  });
+  if (!res.ok) {
+    throw new Error(`Create project "${name}" failed (HTTP ${res.status})`);
+  }
+  const data = (await res.json()) as Record<string, unknown>;
+  // Try several response shapes defensively — shape is not yet formally documented.
+  const gizmo = data.gizmo as Record<string, unknown> | undefined;
+  const inner = (gizmo?.gizmo ?? gizmo) as Record<string, unknown> | undefined;
+  const id =
+    (data.id as string | undefined) ??
+    (data.gizmo_id as string | undefined) ??
+    (inner?.id as string | undefined);
+  if (!id || typeof id !== 'string') {
+    throw new Error(
+      `createProject: no recognizable id in response. Top-level keys: ${Object.keys(data).join(', ')}`,
+    );
+  }
+  return id;
+}
+
 export type RawConversationNode = {
   id: string;
   parent?: string | null;

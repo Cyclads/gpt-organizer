@@ -7,7 +7,10 @@ export type PlanAction = 'delete' | 'move' | 'remove-from-project' | 'rename' | 
 export type ImportPlanRow = {
   id: string;
   action: PlanAction;
+  /** Resolved gizmo ID (g-p-…). Mutually exclusive with projectName. */
   targetGizmoId?: string | null;
+  /** Human-readable project name to resolve at apply time. Mutually exclusive with targetGizmoId. */
+  projectName?: string;
   newTitle?: string;
   notes?: string;
   /** Set when row failed validation */
@@ -28,6 +31,8 @@ export type PlanSummary = {
   skip: number;
   invalid: number;
   actionable: number;
+  /** Distinct project names referenced by name (not by ID) — need resolution at apply time. */
+  projectNames: string[];
 };
 
 const UUID_RE =
@@ -42,9 +47,8 @@ const HEADER_ALIASES: Record<string, string[]> = {
     'targetgizmo_id',
     'gizmo_id',
     'project_id',
-    'project',
-    'target_project',
   ],
+  project_name: ['project_name', 'project', 'target_project', 'target_project_name'],
   new_title: ['new_title', 'newtitle', 'rename_to'],
   notes: ['notes', 'note', 'reason', 'comment', 'comments'],
 };
@@ -149,6 +153,7 @@ function parseRow(
   const id = get('id');
   const actionRaw = get('action');
   const targetRaw = get('target_gizmo_id');
+  const projectNameRaw = get('project_name') || undefined;
   const newTitleRaw = get('new_title') || undefined;
   const notes = get('notes') || undefined;
 
@@ -190,16 +195,14 @@ function parseRow(
   }
 
   if (action === 'move') {
-    const targetGizmoId = targetRaw ? (normalizeGizmoId(targetRaw) ?? targetRaw) : null;
-    if (!targetGizmoId) {
-      return {
-        id,
-        action: 'skip',
-        notes,
-        error: 'Move requires target_gizmo_id',
-      };
+    if (targetRaw) {
+      const targetGizmoId = normalizeGizmoId(targetRaw) ?? targetRaw;
+      return { id, action: 'move', targetGizmoId, newTitle: newTitleRaw, notes };
     }
-    return { id, action: 'move', targetGizmoId, newTitle: newTitleRaw, notes };
+    if (projectNameRaw) {
+      return { id, action: 'move', projectName: projectNameRaw, newTitle: newTitleRaw, notes };
+    }
+    return { id, action: 'skip', notes, error: 'Move requires target_gizmo_id or project_name' };
   }
 
   if (action === 'remove-from-project') {
@@ -244,18 +247,15 @@ export function parseImportJson(text: string, fileName?: string): ImportPlan {
     const targetRaw = String(
       row.target_gizmo_id ?? row.targetGizmoId ?? row.gizmo_id ?? '',
     ).trim();
+    const projectNameRaw = String(
+      row.project_name ?? row.projectName ?? row.project ?? row.target_project ?? '',
+    ).trim();
     const newTitleRaw = String(row.new_title ?? row.newTitle ?? row.rename_to ?? '').trim();
     const notes = row.notes != null ? String(row.notes) : row.reason != null ? String(row.reason) : undefined;
 
     return parseRow(
-      [
-        id,
-        actionRaw,
-        targetRaw,
-        newTitleRaw,
-        notes ?? '',
-      ],
-      { id: 0, action: 1, target_gizmo_id: 2, new_title: 3, notes: 4 },
+      [id, actionRaw, targetRaw, newTitleRaw, notes ?? '', projectNameRaw],
+      { id: 0, action: 1, target_gizmo_id: 2, new_title: 3, notes: 4, project_name: 5 },
     );
   });
 
@@ -271,7 +271,10 @@ export function summarizePlan(plan: ImportPlan): PlanSummary {
     skip: 0,
     invalid: 0,
     actionable: 0,
+    projectNames: [],
   };
+
+  const projectNameSet = new Set<string>();
 
   for (const row of plan.rows) {
     if (row.error) {
@@ -287,8 +290,10 @@ export function summarizePlan(plan: ImportPlan): PlanSummary {
     else if (row.action === 'move') summary.move += 1;
     else if (row.action === 'remove-from-project') summary.removeFromProject += 1;
     if (row.newTitle) summary.rename += 1;
+    if (row.projectName) projectNameSet.add(row.projectName);
   }
 
+  summary.projectNames = [...projectNameSet].sort();
   return summary;
 }
 
@@ -331,6 +336,9 @@ export function formatPlanPreview(plan: ImportPlan): string {
     `  skip: ${s.skip}`,
   ];
   if (s.invalid) lines.push(`  invalid rows: ${s.invalid}`);
+  if (s.projectNames.length) {
+    lines.push(`  projects (resolve at apply): ${s.projectNames.map((n) => `"${n}"`).join(', ')}`);
+  }
 
   const samples = getActionableRows(plan).slice(0, 8);
   if (samples.length) {

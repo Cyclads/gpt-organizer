@@ -49,7 +49,7 @@ import {
 } from './importPlan';
 import { SidebarSelection } from './sidebarSelection';
 import { loadUiState, saveUiState, type OrganizerUiState } from './storage';
-import type { BatchResult } from './types';
+import type { BatchResult, GptProject } from './types';
 
 let ui: OrganizerUiState = loadUiState();
 let busy = false;
@@ -369,7 +369,7 @@ async function handleImportFile(file: File): Promise<void> {
       action: 'import',
       source: 'import-plan',
       reason: `Loaded plan file for review (not applied yet)`,
-      message: `${s.actionable} actionable · delete ${s.delete}, move ${s.move}, remove ${s.removeFromProject}, rename ${s.rename}`,
+      message: `${s.actionable} actionable · delete ${s.delete}, move ${s.move}, remove ${s.removeFromProject}, rename ${s.rename}${s.projectNames.length ? ` · projects: ${s.projectNames.join(', ')}` : ''}`,
       detail: file.name,
       items: getActionableRows(pendingPlan).slice(0, 50).map((row) => ({
         id: row.id,
@@ -415,6 +415,65 @@ async function executePlanRowWithFallback(row: ImportPlanRow): Promise<void> {
   }
 }
 
+type ProjectResolution = {
+  resolvedRows: ImportPlanRow[];
+  created: string[];
+  failed: Map<string, string>;
+};
+
+async function resolveProjectNames(
+  rows: ImportPlanRow[],
+  onStatus: (msg: string) => void,
+): Promise<ProjectResolution> {
+  const distinctNames = [...new Set(rows.filter((r) => r.projectName).map((r) => r.projectName!))];
+  if (!distinctNames.length) return { resolvedRows: rows, created: [], failed: new Map() };
+
+  onStatus('Fetching project list…');
+  let existing: GptProject[] = [];
+  try {
+    existing = await api.fetchProjects();
+  } catch (err) {
+    console.warn(LOG_PREFIX, 'resolveProjectNames: could not fetch projects', err);
+  }
+
+  const nameToId = new Map<string, string>();
+  for (const p of existing) {
+    const normalized = normalizeGizmoId(p.id) ?? p.id;
+    nameToId.set(p.title.trim().toLowerCase(), normalized);
+  }
+
+  const created: string[] = [];
+  const failed = new Map<string, string>();
+
+  for (const name of distinctNames) {
+    const key = name.trim().toLowerCase();
+    if (nameToId.has(key)) continue;
+
+    onStatus(`Creating project "${name}"…`);
+    try {
+      const rawId = await api.createProject(name.trim());
+      const id = normalizeGizmoId(rawId) ?? rawId;
+      nameToId.set(key, id);
+      created.push(name);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      failed.set(key, msg);
+      console.warn(LOG_PREFIX, `resolveProjectNames: failed to create "${name}":`, msg);
+    }
+    await api.sleep(DELETE_DELAY_MS);
+  }
+
+  const resolvedRows = rows.map((row) => {
+    if (!row.projectName) return row;
+    const key = row.projectName.trim().toLowerCase();
+    const id = nameToId.get(key);
+    if (!id) return row;
+    return { ...row, targetGizmoId: id };
+  });
+
+  return { resolvedRows, created, failed };
+}
+
 async function applyPendingPlan(): Promise<void> {
   if (!pendingPlan) {
     setStatus('No plan loaded', true);
@@ -428,20 +487,61 @@ async function applyPendingPlan(): Promise<void> {
   }
 
   const s = summarizePlan(pendingPlan);
-  const confirmed = window.confirm(
-    `Apply import plan?\n\nDelete: ${s.delete}\nMove: ${s.move}\nRemove from project: ${s.removeFromProject}\nRename: ${s.rename}\n\nConversations affected: ${s.actionable}. This cannot be undone from the extension.`,
-  );
+
+  let confirmMsg = `Apply import plan?\n\nDelete: ${s.delete}\nMove: ${s.move}\nRemove from project: ${s.removeFromProject}\nRename: ${s.rename}`;
+  if (s.projectNames.length) {
+    confirmMsg += `\nProjects (create if missing): ${s.projectNames.map((n) => `"${n}"`).join(', ')}`;
+  }
+  confirmMsg += `\n\nConversations affected: ${s.actionable}. This cannot be undone from the extension.`;
+
+  const confirmed = window.confirm(confirmMsg);
   if (!confirmed) return;
 
   busy = true;
   applyRootDataset();
-  setStatus(`Applying 0 / ${actionable.length}…`);
 
+  // Resolve project names → IDs, creating missing projects as needed.
+  let resolvedRows = actionable;
+  const failedProjects = new Map<string, string>();
+
+  if (s.projectNames.length) {
+    const resolution = await resolveProjectNames(actionable, setStatus);
+    resolvedRows = resolution.resolvedRows;
+    for (const [key, errMsg] of resolution.failed) {
+      failedProjects.set(key, errMsg);
+    }
+    if (resolution.created.length) {
+      appendLog({
+        level: 'info',
+        action: 'create-project',
+        source: 'import-plan',
+        reason: 'New projects created during plan execution',
+        message: `Created: ${resolution.created.join(', ')}`,
+      });
+      renderLogs();
+      void refreshProjectSelect();
+    }
+  }
+
+  setStatus(`Applying 0 / ${resolvedRows.length}…`);
   const planFileName = pendingPlan?.fileName;
-  const titlesBefore = conversationTitleMap(actionable.map((r) => r.id));
+  const titlesBefore = conversationTitleMap(resolvedRows.map((r) => r.id));
   const results: BatchResult[] = [];
-  for (let i = 0; i < actionable.length; i += 1) {
-    const row = actionable[i];
+
+  for (let i = 0; i < resolvedRows.length; i += 1) {
+    const row = resolvedRows[i];
+
+    // Row still has projectName but no targetGizmoId → project creation failed.
+    if (row.projectName && !row.targetGizmoId) {
+      const key = row.projectName.trim().toLowerCase();
+      const errMsg = failedProjects.get(key) ?? `Project "${row.projectName}" could not be resolved`;
+      console.warn(LOG_PREFIX, errMsg);
+      results.push({ id: row.id, ok: false, error: errMsg });
+      setStatus(`Applying ${i + 1} / ${resolvedRows.length}…`);
+      if (i < resolvedRows.length - 1) await api.sleep(DELETE_DELAY_MS);
+      continue;
+    }
+
     try {
       await executePlanRowWithFallback(row);
       results.push({ id: row.id, ok: true });
@@ -450,8 +550,8 @@ async function applyPendingPlan(): Promise<void> {
       console.warn(LOG_PREFIX, message);
       results.push({ id: row.id, ok: false, error: message });
     }
-    setStatus(`Applying ${i + 1} / ${actionable.length}…`);
-    if (i < actionable.length - 1) await api.sleep(DELETE_DELAY_MS);
+    setStatus(`Applying ${i + 1} / ${resolvedRows.length}…`);
+    if (i < resolvedRows.length - 1) await api.sleep(DELETE_DELAY_MS);
   }
 
   logBatch(
