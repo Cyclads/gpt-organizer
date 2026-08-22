@@ -274,6 +274,7 @@ function ensureToolbar(): HTMLElement {
             <button type="button" data-action="export-json">Export JSON</button>
             <button type="button" data-action="export-csv">Export CSV</button>
             <button type="button" data-action="export-enriched">Export enriched</button>
+            <button type="button" data-action="export-all-enriched">Export ALL enriched</button>
           </div>
           <div class="gpt-organizer-import">
             <label class="gpt-organizer-file-label">
@@ -844,6 +845,158 @@ async function exportEnriched(): Promise<void> {
   );
 }
 
+type DiscoveredConversation = {
+  id: string;
+  title: string;
+  gizmoId: string | null;
+  projectName: string | null;
+  source: 'no_project' | 'project';
+};
+
+async function discoverAllConversations(
+  onStatus: (msg: string) => void,
+): Promise<DiscoveredConversation[]> {
+  const map = new Map<string, DiscoveredConversation>();
+  const limit = 100;
+
+  // Phase 1 — Main conversation list (includes conversations with gizmo_id set).
+  onStatus('Discovering conversations (main list)…');
+  for (let offset = 0; offset < 100_000; offset += limit) {
+    const page = await api.fetchConversationsPage(offset, limit);
+    for (const item of page.items) {
+      if (!item.id) continue;
+      map.set(item.id, {
+        id: item.id,
+        title: item.title ?? item.id,
+        gizmoId: item.gizmo_id ?? null,
+        projectName: null,
+        source: item.gizmo_id ? 'project' : 'no_project',
+      });
+    }
+    if (!page.hasMore) break;
+    await api.sleep(DELETE_DELAY_MS);
+  }
+
+  // Phase 2 — Projects: resolve names + fetch their conversation lists.
+  onStatus(`Found ${map.size} in main list — fetching projects…`);
+  const projects = await api.fetchProjects();
+
+  const projectNameById = new Map(
+    projects.map((p) => [normalizeGizmoId(p.id) ?? p.id, p.title]),
+  );
+
+  // Backfill project names for conversations already discovered in Phase 1.
+  for (const conv of map.values()) {
+    if (conv.gizmoId) {
+      const key = normalizeGizmoId(conv.gizmoId) ?? conv.gizmoId;
+      conv.projectName = projectNameById.get(key) ?? null;
+    }
+  }
+
+  // Phase 3 — Per-project conversation lists (catches conversations not in main list).
+  for (const project of projects) {
+    const pId = normalizeGizmoId(project.id) ?? project.id;
+    onStatus(`Discovering project "${project.title}"…`);
+    for (let offset = 0; offset < 100_000; offset += limit) {
+      const page = await api.fetchProjectConversationsPage(pId, offset, limit);
+      for (const item of page.items) {
+        if (!item.id) continue;
+        if (map.has(item.id)) {
+          // Already found — ensure project info is filled (more specific than gizmo_id alone).
+          const existing = map.get(item.id)!;
+          if (!existing.projectName) {
+            existing.gizmoId = pId;
+            existing.projectName = project.title;
+            existing.source = 'project';
+          }
+        } else {
+          map.set(item.id, {
+            id: item.id,
+            title: item.title ?? item.id,
+            gizmoId: pId,
+            projectName: project.title,
+            source: 'project',
+          });
+        }
+      }
+      if (!page.hasMore) break;
+      await api.sleep(DELETE_DELAY_MS);
+    }
+  }
+
+  return [...map.values()];
+}
+
+async function exportAllEnriched(): Promise<void> {
+  busy = true;
+  applyRootDataset();
+
+  // Discovery phase.
+  let discovered: DiscoveredConversation[];
+  try {
+    discovered = await discoverAllConversations(setStatus);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    setStatus(`Discovery failed: ${msg}`, true);
+    busy = false;
+    applyRootDataset();
+    return;
+  }
+
+  setStatus(`Found ${discovered.length} conversations — exporting…`);
+  await api.sleep(200);
+
+  // Export phase — sequential, one conversation at a time.
+  const lines: string[] = [];
+  let ok = 0;
+  let failed = 0;
+
+  for (let i = 0; i < discovered.length; i++) {
+    const conv = discovered[i];
+    setStatus(`Exporting ${i + 1} / ${discovered.length}: ${conv.title.slice(0, 40)}`);
+    try {
+      const raw = await api.fetchConversationDetail(conv.id);
+      const record = buildExportRecord(raw, conv.id, raw.title ?? conv.title);
+      lines.push(
+        JSON.stringify({
+          ...record,
+          project_gizmo_id: conv.gizmoId,
+          project_name: conv.projectName,
+          source: conv.source,
+        }),
+      );
+      ok++;
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorLine: EnrichedExportLine = { id: conv.id, title: conv.title, error: errorMsg };
+      lines.push(JSON.stringify(errorLine));
+      failed++;
+      console.warn(LOG_PREFIX, `exportAllEnriched: failed for ${conv.id}:`, errorMsg);
+    }
+    if (i < discovered.length - 1) await api.sleep(DELETE_DELAY_MS);
+  }
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  downloadJsonl(`gpt-organizer-all-enriched-${stamp}.jsonl`, lines);
+
+  appendLog({
+    level: failed ? 'error' : 'success',
+    action: 'export-all-enriched',
+    source: 'manual',
+    reason: 'User exported all conversations (enriched JSONL, no selection required)',
+    message: `${ok} exported${failed ? `, ${failed} failed` : ''} — ${discovered.length} total`,
+  });
+  renderLogs();
+
+  busy = false;
+  applyRootDataset();
+  setStatus(
+    failed
+      ? `All enriched: ${ok} ok, ${failed} errors — see JSONL`
+      : `All enriched: exported ${ok} conversations`,
+  );
+}
+
 async function moveSelected(): Promise<void> {
   const select = document.getElementById('gpt-organizer-project-select');
   if (!(select instanceof HTMLSelectElement) || !select.value) {
@@ -1034,6 +1187,9 @@ async function handleAction(action: string): Promise<void> {
       break;
     case 'export-enriched':
       await exportEnriched();
+      break;
+    case 'export-all-enriched':
+      await exportAllEnriched();
       break;
     case 'apply-plan':
       await applyPendingPlan();

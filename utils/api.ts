@@ -157,6 +157,52 @@ export async function fetchConversationsPage(
   return { items, hasMore };
 }
 
+// Confirmed endpoint (probe, Jun 2026): GET /backend-api/gizmos/{gizmoId}/conversations
+// Response shape assumed to match /backend-api/conversations (same item structure, same pagination).
+export async function fetchProjectConversationsPage(
+  gizmoId: string,
+  offset: number,
+  limit: number,
+): Promise<{ items: ConversationListItem[]; hasMore: boolean }> {
+  const params = new URLSearchParams({
+    offset: String(offset),
+    limit: String(limit),
+    order: 'updated',
+  });
+  const res = await backendFetch(
+    `/backend-api/gizmos/${encodeURIComponent(gizmoId)}/conversations?${params}`,
+    { method: 'GET' },
+  );
+  if (!res.ok) {
+    throw new Error(`Project conversations failed for ${gizmoId} (HTTP ${res.status})`);
+  }
+  const data = (await res.json()) as {
+    items?: unknown[];
+    has_more?: boolean;
+    hasMore?: boolean;
+  };
+  const items: ConversationListItem[] = [];
+  for (const raw of Array.isArray(data.items) ? data.items : []) {
+    const row = raw as Record<string, unknown>;
+    if (typeof row.id !== 'string') continue;
+    items.push({
+      id: row.id,
+      title: row.title as string | undefined,
+      create_time: row.create_time as string | number | undefined,
+      update_time: row.update_time as string | number | undefined,
+      gizmo_id: row.gizmo_id as string | null | undefined,
+      is_archived: row.is_archived as boolean | undefined,
+      is_starred: row.is_starred as boolean | null | undefined,
+      is_temporary_chat: row.is_temporary_chat as boolean | undefined,
+      workspace_id: row.workspace_id as string | undefined,
+      conversation_origin: row.conversation_origin as string | null | undefined,
+      snippet: row.snippet as string | undefined,
+    });
+  }
+  const hasMore = data.has_more === true || data.hasMore === true;
+  return { items, hasMore };
+}
+
 export async function fetchProjects(): Promise<GptProject[]> {
   const projects: GptProject[] = [];
   let cursor: number | null = null;
