@@ -864,6 +864,7 @@ async function discoverAllConversations(
   const map = new Map<string, DiscoveredConversation>();
   const failedProjects: Array<{ title: string; id: string; error: string }> = [];
   const limit = 100;
+  const projectLimit = 5;
 
   // Phase 1 — Main conversation list (includes conversations with gizmo_id set).
   onStatus('Discovering conversations (main list)…');
@@ -906,7 +907,7 @@ async function discoverAllConversations(
     let cursor = '0';
     try {
       for (let pageNum = 0; pageNum < 200; pageNum++) {
-        const result = await api.fetchProjectConversationsPage(pId, cursor, limit);
+        const result = await api.fetchProjectConversationsPage(pId, cursor, projectLimit);
         for (const item of result.items) {
           if (!item.id) continue;
           if (map.has(item.id)) {
