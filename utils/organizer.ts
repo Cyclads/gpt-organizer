@@ -36,7 +36,6 @@ import {
   type EnrichedExportLine,
 } from './conversationSampler';
 import {
-  executePlanRow,
   executePrimaryAction,
   formatPlanPreview,
   getActionableRows,
@@ -397,21 +396,38 @@ async function handleImportFile(file: File): Promise<void> {
 }
 
 async function executePlanRowWithFallback(row: ImportPlanRow): Promise<void> {
-  // rename step: no fallback — failure aborts the entire row
+  // True when this row has both a rename and a primary action (e.g. rename + move).
+  // Used to prefix primary-action errors with "rename: ok" for clarity in logs.
+  const renameAndAction = !!row.newTitle && row.action !== 'rename';
+
+  // Rename step — no fallback, failure aborts the entire row.
   if (row.newTitle) {
-    await api.renameConversation(row.id, row.newTitle);
+    try {
+      await api.renameConversation(row.id, row.newTitle);
+    } catch (err) {
+      throw new Error(`rename: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   if (row.action === 'rename') return;
 
-  // primary action: UI fallback for move only
+  // Primary action — UI fallback for move only.
+  const pfx = renameAndAction ? 'rename: ok · ' : '';
   try {
     await executePrimaryAction(row);
   } catch (firstErr) {
     if (row.action === 'move' && row.targetGizmoId) {
-      await moveViaUi(row.id, row.targetGizmoId);
-      return;
+      try {
+        await moveViaUi(row.id, row.targetGizmoId);
+        return;
+      } catch (uiErr) {
+        throw new Error(
+          `${pfx}move (api+ui): ${uiErr instanceof Error ? uiErr.message : String(uiErr)}`,
+        );
+      }
     }
-    throw firstErr;
+    throw new Error(
+      `${pfx}${row.action}: ${firstErr instanceof Error ? firstErr.message : String(firstErr)}`,
+    );
   }
 }
 
@@ -429,11 +445,22 @@ async function resolveProjectNames(
   if (!distinctNames.length) return { resolvedRows: rows, created: [], failed: new Map() };
 
   onStatus('Fetching project list…');
-  let existing: GptProject[] = [];
+  let existing: GptProject[];
   try {
     existing = await api.fetchProjects();
   } catch (err) {
-    console.warn(LOG_PREFIX, 'resolveProjectNames: could not fetch projects', err);
+    // Fail closed: without the live project list we cannot distinguish existing from new.
+    // Creating without verification risks duplicates — refuse all resolutions instead.
+    const fetchErr = err instanceof Error ? err.message : String(err);
+    console.warn(LOG_PREFIX, 'resolveProjectNames: fetchProjects failed — aborting to prevent duplicates', err);
+    const failed = new Map<string, string>();
+    for (const name of distinctNames) {
+      failed.set(
+        name.trim().toLowerCase(),
+        `Cannot resolve project "${name}": project list unavailable (${fetchErr})`,
+      );
+    }
+    return { resolvedRows: rows, created: [], failed };
   }
 
   const nameToId = new Map<string, string>();

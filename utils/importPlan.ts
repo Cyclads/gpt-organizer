@@ -371,7 +371,10 @@ export async function executePrimaryAction(row: ImportPlanRow): Promise<void> {
     await api.setConversationGizmo(row.id, null);
     return;
   }
-  if (row.action === 'move' && row.targetGizmoId) {
+  if (row.action === 'move') {
+    if (!row.targetGizmoId) {
+      throw new Error(`move: targetGizmoId is missing for conversation ${row.id}`);
+    }
     await api.setConversationGizmo(row.id, row.targetGizmoId);
   }
 }

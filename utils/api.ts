@@ -54,16 +54,20 @@ export async function setConversationGizmo(
   gizmoId: string | null,
 ): Promise<void> {
   const normalized = gizmoId == null ? null : (normalizeGizmoId(gizmoId) ?? gizmoId);
+  // ChatGPT requires an empty string to remove a conversation from a project.
+  // Sending JSON null is accepted (HTTP 200) but has no effect — the gizmo_id stays unchanged.
+  const apiValue = normalized === null ? '' : normalized;
+  const op = normalized === null ? 'Remove from project' : 'Move';
 
   const res = await backendFetch(
     `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
     {
       method: 'PATCH',
-      body: JSON.stringify({ gizmo_id: normalized }),
+      body: JSON.stringify({ gizmo_id: apiValue }),
     },
   );
   if (!res.ok) {
-    throw new Error(`Move failed for ${conversationId} (HTTP ${res.status})`);
+    throw new Error(`${op} failed for ${conversationId} (HTTP ${res.status})`);
   }
 }
 
@@ -203,27 +207,51 @@ export async function fetchProjects(): Promise<GptProject[]> {
 }
 
 export async function createProject(name: string): Promise<string> {
+  const trimmedName = name.trim();
   const res = await backendFetch('/backend-api/projects', {
     method: 'POST',
-    body: JSON.stringify({ instructions: '', name: name.trim(), memory_scope: 'unset' }),
+    body: JSON.stringify({ instructions: '', name: trimmedName, memory_scope: 'unset' }),
   });
   if (!res.ok) {
-    throw new Error(`Create project "${name}" failed (HTTP ${res.status})`);
+    throw new Error(`Create project "${trimmedName}" failed (HTTP ${res.status})`);
   }
   const data = (await res.json()) as Record<string, unknown>;
-  // Try several response shapes defensively — shape is not yet formally documented.
-  const gizmo = data.gizmo as Record<string, unknown> | undefined;
-  const inner = (gizmo?.gizmo ?? gizmo) as Record<string, unknown> | undefined;
+
+  // Confirmed response shape: { resource: { ... }, error: null, sharing_targets: [] }
+  // Also try legacy/alternative shapes defensively.
+  const resource = data.resource as Record<string, unknown> | undefined;
+  const gizmoFromData = data.gizmo as Record<string, unknown> | undefined;
+  const gizmoFromResource = resource?.gizmo as Record<string, unknown> | undefined;
+  const inner =
+    ((gizmoFromData?.gizmo ?? gizmoFromData) as Record<string, unknown> | undefined) ??
+    ((gizmoFromResource?.gizmo ?? gizmoFromResource) as Record<string, unknown> | undefined);
+
   const id =
     (data.id as string | undefined) ??
     (data.gizmo_id as string | undefined) ??
+    (resource?.id as string | undefined) ??
+    (resource?.gizmo_id as string | undefined) ??
     (inner?.id as string | undefined);
-  if (!id || typeof id !== 'string') {
-    throw new Error(
-      `createProject: no recognizable id in response. Top-level keys: ${Object.keys(data).join(', ')}`,
-    );
+
+  if (id && typeof id === 'string') return id;
+
+  // ID not found in the immediate response — project was likely created successfully.
+  // Verify by fetching the project list and matching by name (max 3 attempts, 1 s apart).
+  const nameLower = trimmedName.toLowerCase();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await sleep(1000);
+    try {
+      const projects = await fetchProjects();
+      const match = projects.find((p) => p.title.trim().toLowerCase() === nameLower);
+      if (match) return match.id;
+    } catch {
+      // ignore transient fetch error, keep retrying
+    }
   }
-  return id;
+
+  throw new Error(
+    `createProject: "${trimmedName}" may have been created but ID could not be confirmed. Response keys: ${Object.keys(data).join(', ')}`,
+  );
 }
 
 export type RawConversationNode = {
