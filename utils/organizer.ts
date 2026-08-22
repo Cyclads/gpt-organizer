@@ -191,6 +191,7 @@ function renderLogs(): void {
 }
 
 export function syncCheckboxes(): void {
+  ensureToolbar();
   selection.sync(ui.enabled);
 }
 
@@ -202,6 +203,7 @@ function ensureToolbar(): HTMLElement {
   let root = document.getElementById(ROOT_ID);
   if (root) return root;
 
+  importListenerBound = false;
   root = document.createElement('div');
   root.id = ROOT_ID;
   root.innerHTML = `
