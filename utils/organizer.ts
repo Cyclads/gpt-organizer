@@ -53,6 +53,14 @@ import {
   saveExportCheckpoint,
   type ExportCheckpoint,
 } from './exportCheckpoint';
+import {
+  clearImportCheckpoint,
+  fingerprintPlan,
+  loadImportCheckpoint,
+  saveImportCheckpoint,
+  type ImportCheckpoint,
+  type ImportRowState,
+} from './importCheckpoint';
 import { loadUiState, saveUiState, type OrganizerUiState } from './storage';
 import type { BatchResult, GptProject } from './types';
 
@@ -402,6 +410,83 @@ async function handleImportFile(file: File): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Import pacing & retry
+// ---------------------------------------------------------------------------
+
+type ImportPacingState = {
+  delayMs: number;           // current inter-request delay (floor: 1 500 ms)
+  successesSince429: number; // consecutive successful API calls since last 429
+};
+
+class ImportPausedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ImportPausedError';
+  }
+}
+
+const IMPORT_RECOVERY_THRESHOLD = 25; // consecutive successes needed to step pacing down
+
+async function importApiCallWithCooldown<T>(
+  statusLabel: string,
+  pacing: ImportPacingState,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const MAX_TOTAL_WAIT_MS = 60 * 60 * 1_000; // 60 min absolute guard per operation
+  let totalWaitedMs = 0;
+
+  while (true) {
+    try {
+      const result = await fn();
+      pacing.successesSince429++;
+      // Progressive recovery: step down pacing every 25 consecutive successes.
+      if (pacing.delayMs > 1_500 && pacing.successesSince429 % IMPORT_RECOVERY_THRESHOLD === 0) {
+        if (pacing.delayMs >= 5_000) pacing.delayMs = 3_000;
+        else if (pacing.delayMs >= 3_000) pacing.delayMs = 2_000;
+        else pacing.delayMs = 1_500;
+      }
+      return result;
+    } catch (err) {
+      if (!(err instanceof api.RateLimitError)) throw err;
+
+      const quickRecurrence = pacing.successesSince429 < 3;
+      const baseCooldown = quickRecurrence ? 180_000 : 60_000;
+      const retryAfterMs = err.retryAfterMs > 0 ? err.retryAfterMs + 1_000 : 0;
+      const cooldownMs = Math.max(baseCooldown, retryAfterMs);
+
+      totalWaitedMs += cooldownMs;
+      if (totalWaitedMs > MAX_TOTAL_WAIT_MS) {
+        throw new ImportPausedError(
+          `Rate limit: import paused after 60 min on "${statusLabel}"`,
+        );
+      }
+
+      if (quickRecurrence) {
+        pacing.delayMs = 5_000;
+      } else if (pacing.delayMs < 3_000) {
+        pacing.delayMs = 3_000;
+      }
+      pacing.successesSince429 = 0;
+
+      const totalSec = Math.ceil(cooldownMs / 1_000);
+      setStatus(
+        quickRecurrence
+          ? `Rate limited again — ${statusLabel} — Global cooldown ${totalSec}s — switching to 5.0s pacing`
+          : `Rate limited — ${statusLabel} — Cooling down for ${totalSec}s`,
+      );
+      for (let s = totalSec; s > 0; s--) {
+        setStatus(
+          `${quickRecurrence ? 'Rate limited again' : 'Rate limited'} — ${statusLabel} — Retrying same operation in ${s}s`,
+        );
+        await api.sleep(1_000);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 async function executePlanRowWithFallback(row: ImportPlanRow): Promise<void> {
   // True when this row has both a rename and a primary action (e.g. rename + move).
   // Used to prefix primary-action errors with "rename: ok" for clarity in logs.
@@ -447,6 +532,7 @@ type ProjectResolution = {
 async function resolveProjectNames(
   rows: ImportPlanRow[],
   onStatus: (msg: string) => void,
+  pacing: ImportPacingState,
 ): Promise<ProjectResolution> {
   const distinctNames = [...new Set(rows.filter((r) => r.projectName).map((r) => r.projectName!))];
   if (!distinctNames.length) return { resolvedRows: rows, created: [], failed: new Map() };
@@ -454,10 +540,14 @@ async function resolveProjectNames(
   onStatus('Fetching project list…');
   let existing: GptProject[];
   try {
-    existing = await api.fetchProjects();
+    existing = await importApiCallWithCooldown(
+      'Fetching project list',
+      pacing,
+      () => api.fetchProjects(),
+    );
   } catch (err) {
-    // Fail closed: without the live project list we cannot distinguish existing from new.
-    // Creating without verification risks duplicates — refuse all resolutions instead.
+    if (err instanceof ImportPausedError) throw err;
+    // Non-429 error: fail closed — cannot distinguish existing from new → refuse all resolutions.
     const fetchErr = err instanceof Error ? err.message : String(err);
     console.warn(LOG_PREFIX, 'resolveProjectNames: fetchProjects failed — aborting to prevent duplicates', err);
     const failed = new Map<string, string>();
@@ -485,16 +575,21 @@ async function resolveProjectNames(
 
     onStatus(`Creating project "${name}"…`);
     try {
-      const rawId = await api.createProject(name.trim());
+      const rawId = await importApiCallWithCooldown(
+        `Creating project "${name}"`,
+        pacing,
+        () => api.createProject(name.trim()),
+      );
       const id = normalizeGizmoId(rawId) ?? rawId;
       nameToId.set(key, id);
       created.push(name);
     } catch (err) {
+      if (err instanceof ImportPausedError) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       failed.set(key, msg);
       console.warn(LOG_PREFIX, `resolveProjectNames: failed to create "${name}":`, msg);
     }
-    await api.sleep(DELETE_DELAY_MS);
+    await api.sleep(pacing.delayMs);
   }
 
   const resolvedRows = rows.map((row) => {
@@ -520,87 +615,247 @@ async function applyPendingPlan(): Promise<void> {
     return;
   }
 
-  const s = summarizePlan(pendingPlan);
+  // --- Fingerprint + checkpoint resume check ---
+  const fingerprint = await fingerprintPlan(actionable);
+  const existingCheckpoint = await loadImportCheckpoint();
+  let doResume = false;
 
-  let confirmMsg = `Apply import plan?\n\nDelete: ${s.delete}\nMove: ${s.move}\nRemove from project: ${s.removeFromProject}\nRename: ${s.rename}`;
-  if (s.projectNames.length) {
-    confirmMsg += `\nProjects (create if missing): ${s.projectNames.map((n) => `"${n}"`).join(', ')}`;
+  if (existingCheckpoint && existingCheckpoint.csvFingerprint === fingerprint) {
+    const completedCount = existingCheckpoint.rowStates.filter((s) => s.completed).length;
+    const totalCount = existingCheckpoint.rowStates.length;
+    doResume = window.confirm(
+      `Resume import: ${completedCount} / ${totalCount} rows already completed.\n\nOK = resume from where it stopped\nCancel = start fresh (existing progress will be lost)`,
+    );
+    if (!doResume) {
+      await clearImportCheckpoint();
+    }
+  } else if (existingCheckpoint) {
+    // Incompatible CSV — ask before discarding the existing progress.
+    const completedCount = existingCheckpoint.rowStates.filter((s) => s.completed).length;
+    const totalCount = existingCheckpoint.rowStates.length;
+    const proceed = window.confirm(
+      `An unfinished import checkpoint exists for another CSV (${completedCount} / ${totalCount} rows completed).\n\nStarting this CSV will replace the saved import progress.\n\nContinue?`,
+    );
+    if (!proceed) {
+      return; // preserve the existing checkpoint untouched
+    }
+    await clearImportCheckpoint();
   }
-  confirmMsg += `\n\nConversations affected: ${s.actionable}. This cannot be undone from the extension.`;
 
-  const confirmed = window.confirm(confirmMsg);
-  if (!confirmed) return;
+  // --- Confirm dialog (fresh start only) ---
+  if (!doResume) {
+    const s = summarizePlan(pendingPlan);
+    let confirmMsg = `Apply import plan?\n\nDelete: ${s.delete}\nMove: ${s.move}\nRemove from project: ${s.removeFromProject}\nRename: ${s.rename}`;
+    if (s.projectNames.length) {
+      confirmMsg += `\nProjects (create if missing): ${s.projectNames.map((n) => `"${n}"`).join(', ')}`;
+    }
+    confirmMsg += `\n\nConversations affected: ${s.actionable}. This cannot be undone from the extension.`;
+    if (!window.confirm(confirmMsg)) return;
+  }
 
   busy = true;
   applyRootDataset();
 
-  // Resolve project names → IDs, creating missing projects as needed.
+  const pacing: ImportPacingState = { delayMs: 1_500, successesSince429: 0 };
+
+  // --- Initialize or restore checkpoint ---
+  let checkpoint: ImportCheckpoint;
+  let rowStates: ImportRowState[];
+
+  if (doResume && existingCheckpoint) {
+    checkpoint = existingCheckpoint;
+    rowStates = checkpoint.rowStates;
+  } else {
+    rowStates = actionable.map((row) => ({
+      id: row.id,
+      action: row.action,
+      renameDone: !row.newTitle,             // no rename step needed
+      primaryDone: row.action === 'rename',  // rename-only has no primary action
+      completed: false,
+      error: null,
+    }));
+    checkpoint = {
+      version: 1,
+      startedAt: new Date().toISOString(),
+      csvFingerprint: fingerprint,
+      rowStates,
+      stats: {
+        renameCount: 0,
+        moveCount: 0,
+        removeCount: 0,
+        deleteCount: 0,
+        projectsCreatedCount: 0,
+        rateLimitCooldowns: 0,
+      },
+    };
+    await saveImportCheckpoint(checkpoint);
+  }
+
+  // --- Resolve project names (with 429 retry) ---
   let resolvedRows = actionable;
   const failedProjects = new Map<string, string>();
+  const planSummary = summarizePlan(pendingPlan);
 
-  if (s.projectNames.length) {
-    const resolution = await resolveProjectNames(actionable, setStatus);
-    resolvedRows = resolution.resolvedRows;
-    for (const [key, errMsg] of resolution.failed) {
-      failedProjects.set(key, errMsg);
-    }
-    if (resolution.created.length) {
-      appendLog({
-        level: 'info',
-        action: 'create-project',
-        source: 'import-plan',
-        reason: 'New projects created during plan execution',
-        message: `Created: ${resolution.created.join(', ')}`,
-      });
-      renderLogs();
-      void refreshProjectSelect();
+  if (planSummary.projectNames.length) {
+    try {
+      const resolution = await resolveProjectNames(actionable, setStatus, pacing);
+      resolvedRows = resolution.resolvedRows;
+      for (const [key, errMsg] of resolution.failed) {
+        failedProjects.set(key, errMsg);
+      }
+      if (resolution.created.length) {
+        checkpoint.stats.projectsCreatedCount += resolution.created.length;
+        appendLog({
+          level: 'info',
+          action: 'create-project',
+          source: 'import-plan',
+          reason: 'New projects created during plan execution',
+          message: `Created: ${resolution.created.join(', ')}`,
+        });
+        renderLogs();
+        void refreshProjectSelect();
+      }
+    } catch (err) {
+      if (err instanceof ImportPausedError) {
+        setStatus('Import paused: rate-limited during project resolution. Progress saved. Resume later.', true);
+        await saveImportCheckpoint(checkpoint);
+        busy = false;
+        applyRootDataset();
+        return;
+      }
+      throw err;
     }
   }
 
-  setStatus(`Applying 0 / ${resolvedRows.length}…`);
+  // --- Pre-populate results with already-completed rows (resume case) ---
+  const results: BatchResult[] = rowStates
+    .filter((s) => s.completed)
+    .map((s) => ({ id: s.id, ok: !s.error, error: s.error ?? undefined }));
+
   const planFileName = pendingPlan?.fileName;
-  const titlesBefore = conversationTitleMap(resolvedRows.map((r) => r.id));
-  const results: BatchResult[] = [];
+  const titlesBefore = conversationTitleMap(actionable.map((r) => r.id));
+  const total = rowStates.length;
 
-  for (let i = 0; i < resolvedRows.length; i += 1) {
+  // --- Main import loop ---
+  for (let i = 0; i < total; i++) {
+    const state = rowStates[i];
+    if (state.completed) continue; // already done from a previous session
+
     const row = resolvedRows[i];
+    const pacingLabel = `${(pacing.delayMs / 1_000).toFixed(1)}s`;
 
-    // Row still has projectName but no targetGizmoId → project creation failed.
+    // Project resolution failed for this row — mark as error without calling API.
     if (row.projectName && !row.targetGizmoId) {
       const key = row.projectName.trim().toLowerCase();
       const errMsg = failedProjects.get(key) ?? `Project "${row.projectName}" could not be resolved`;
-      console.warn(LOG_PREFIX, errMsg);
+      state.error = errMsg;
+      state.completed = true;
       results.push({ id: row.id, ok: false, error: errMsg });
-      setStatus(`Applying ${i + 1} / ${resolvedRows.length}…`);
-      if (i < resolvedRows.length - 1) await api.sleep(DELETE_DELAY_MS);
+      await saveImportCheckpoint(checkpoint);
+      console.warn(LOG_PREFIX, errMsg);
+      if (i < total - 1 && !rowStates[i + 1]?.completed) await api.sleep(pacing.delayMs);
       continue;
     }
 
+    let importPaused = false;
+
     try {
-      await executePlanRowWithFallback(row);
+      // Step 1: Rename (if needed and not yet done).
+      if (!state.renameDone && row.newTitle) {
+        setStatus(`Importing ${i + 1} / ${total} — rename — pacing ${pacingLabel}`);
+        await importApiCallWithCooldown(
+          `${i + 1} / ${total} — rename`,
+          pacing,
+          () => api.renameConversation(row.id, row.newTitle!),
+        );
+        state.renameDone = true;
+        checkpoint.stats.renameCount++;
+        await saveImportCheckpoint(checkpoint);
+        if (!state.primaryDone) await api.sleep(pacing.delayMs);
+      }
+
+      // Step 2: Primary action (if needed and not yet done).
+      if (!state.primaryDone) {
+        setStatus(`Importing ${i + 1} / ${total} — ${row.action} — pacing ${pacingLabel}`);
+        try {
+          await importApiCallWithCooldown(
+            `${i + 1} / ${total} — ${row.action}`,
+            pacing,
+            () => executePrimaryAction(row),
+          );
+        } catch (primaryErr) {
+          if (primaryErr instanceof ImportPausedError) throw primaryErr;
+          // Non-429 API failure — try UI fallback for move only.
+          if (row.action === 'move' && row.targetGizmoId) {
+            try {
+              await moveViaUi(row.id, row.targetGizmoId);
+            } catch (uiErr) {
+              const pfx = row.newTitle && state.renameDone ? 'rename: ok · ' : '';
+              throw new Error(
+                `${pfx}move (api+ui): ${uiErr instanceof Error ? uiErr.message : String(uiErr)}`,
+              );
+            }
+          } else {
+            const pfx = row.newTitle && state.renameDone ? 'rename: ok · ' : '';
+            throw new Error(
+              `${pfx}${row.action}: ${primaryErr instanceof Error ? primaryErr.message : String(primaryErr)}`,
+            );
+          }
+        }
+        state.primaryDone = true;
+        if (row.action === 'move') checkpoint.stats.moveCount++;
+        else if (row.action === 'remove-from-project') checkpoint.stats.removeCount++;
+        else if (row.action === 'delete') checkpoint.stats.deleteCount++;
+        await saveImportCheckpoint(checkpoint);
+      }
+
+      state.completed = true;
+      await saveImportCheckpoint(checkpoint);
       results.push({ id: row.id, ok: true });
+
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn(LOG_PREFIX, message);
-      results.push({ id: row.id, ok: false, error: message });
+      if (err instanceof ImportPausedError) {
+        importPaused = true;
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        state.error = message;
+        state.completed = true;
+        await saveImportCheckpoint(checkpoint);
+        results.push({ id: row.id, ok: false, error: message });
+        console.warn(LOG_PREFIX, `Import row ${row.id}:`, message);
+      }
     }
-    setStatus(`Applying ${i + 1} / ${resolvedRows.length}…`);
-    if (i < resolvedRows.length - 1) await api.sleep(DELETE_DELAY_MS);
+
+    if (importPaused) {
+      setStatus(
+        'Import paused: rate-limited for 60+ min. Progress saved. Resume later.',
+        true,
+      );
+      await saveImportCheckpoint(checkpoint);
+      busy = false;
+      applyRootDataset();
+      return;
+    }
+
+    if (i < total - 1 && !rowStates[i + 1]?.completed) {
+      await api.sleep(pacing.delayMs);
+    }
   }
 
+  // --- Finalize ---
   logBatch(
     'import-plan',
     results,
     {
       source: 'import-plan',
-      reason: planFileName ?
-        `Applied CSV/JSON plan (${planFileName})`
-      : 'Applied imported plan',
+      reason: planFileName ? `Applied CSV/JSON plan (${planFileName})` : 'Applied imported plan',
       planRows: actionable,
     },
     'success',
     titlesBefore,
   );
+
+  await clearImportCheckpoint();
   pendingPlan = null;
   savePendingPlan(null);
   renderImportPreview();
@@ -610,12 +865,21 @@ async function applyPendingPlan(): Promise<void> {
   syncCheckboxes();
   updateCount();
 
-  const failed = results.filter((r) => !r.ok);
+  const failedResults = results.filter((r) => !r.ok);
+  const s = checkpoint.stats;
+  const statParts: string[] = [];
+  if (s.renameCount) statParts.push(`${s.renameCount} renamed`);
+  if (s.moveCount) statParts.push(`${s.moveCount} moved`);
+  if (s.removeCount) statParts.push(`${s.removeCount} removed`);
+  if (s.deleteCount) statParts.push(`${s.deleteCount} deleted`);
+  if (s.projectsCreatedCount) statParts.push(`${s.projectsCreatedCount} project(s) created`);
+  const statSuffix = statParts.length ? ` (${statParts.join(', ')})` : '';
+
   setStatus(
-    failed.length ?
-      `Plan applied: ${results.length - failed.length} ok, ${failed.length} failed`
-    : `Plan applied: ${results.length} operations`,
-    failed.length > 0,
+    failedResults.length
+      ? `Plan applied: ${results.length - failedResults.length} ok, ${failedResults.length} failed${statSuffix}`
+      : `Plan applied: ${results.length} operations${statSuffix}`,
+    failedResults.length > 0,
   );
 }
 

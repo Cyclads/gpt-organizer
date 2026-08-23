@@ -13,6 +13,14 @@ export class RateLimitError extends Error {
   }
 }
 
+function raiseIfRateLimited(res: Response): void {
+  if (res.status === 429) {
+    const header = res.headers.get('Retry-After');
+    const ms = header ? parseFloat(header) * 1_000 : 0;
+    throw new RateLimitError(ms > 0 ? ms : 0);
+  }
+}
+
 export async function getAccessToken(): Promise<string> {
   const res = await fetch('/api/auth/session', {
     method: 'GET',
@@ -51,6 +59,7 @@ export async function deleteConversation(conversationId: string): Promise<void> 
       body: JSON.stringify({ is_visible: false }),
     },
   );
+  raiseIfRateLimited(res);
   if (!res.ok) {
     throw new Error(`Delete failed for ${conversationId} (HTTP ${res.status})`);
   }
@@ -73,6 +82,7 @@ export async function setConversationGizmo(
       body: JSON.stringify({ gizmo_id: apiValue }),
     },
   );
+  raiseIfRateLimited(res);
   if (!res.ok) {
     throw new Error(`${op} failed for ${conversationId} (HTTP ${res.status})`);
   }
@@ -99,6 +109,7 @@ export async function renameConversation(
       body: JSON.stringify({ title: trimmed }),
     },
   );
+  raiseIfRateLimited(res);
   if (!res.ok) {
     throw new Error(`Rename failed for ${conversationId} (HTTP ${res.status})`);
   }
@@ -232,6 +243,7 @@ export async function fetchProjects(): Promise<GptProject[]> {
       `/backend-api/gizmos/snorlax/sidebar?${params}`,
       { method: 'GET' },
     );
+    raiseIfRateLimited(res);
     if (!res.ok) {
       throw new Error(`Projects list failed (HTTP ${res.status})`);
     }
@@ -275,6 +287,7 @@ export async function createProject(name: string): Promise<string> {
     method: 'POST',
     body: JSON.stringify({ instructions: '', name: trimmedName, memory_scope: 'unset' }),
   });
+  raiseIfRateLimited(res);
   if (!res.ok) {
     throw new Error(`Create project "${trimmedName}" failed (HTTP ${res.status})`);
   }
